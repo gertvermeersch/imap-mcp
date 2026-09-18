@@ -27,6 +27,17 @@ app.set('trust proxy', 1);
 
 const resourceUrl = new URL(cfg.MCP_RESOURCE_URL);
 
+/**
+ * One line per OAuth endpoint hit. Different clients give up at different
+ * points in the flow and most of them say nothing about why, so the server log
+ * is the only place the sequence is visible: metadata -> register -> authorize
+ * -> token. A flow that stops after /authorize never came back for a token.
+ */
+app.use(['/.well-known', '/register', '/authorize', '/token', '/revoke'], (req, _res, next) => {
+  console.log(`[oauth] ${req.method} ${req.originalUrl.split('?')[0]} ua=${req.get('user-agent') ?? '-'}`);
+  next();
+});
+
 // OAuth 2.1 authorization server + protected resource metadata. Must be
 // mounted at the application root: the .well-known paths are absolute.
 app.use(

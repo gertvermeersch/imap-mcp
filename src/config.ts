@@ -111,7 +111,13 @@ export function loadConfig(): Config {
   }
   cached = {
     ...parsed.data,
-    MCP_RESOURCE_URL: normalizeResourceUrl(parsed.data.MCP_RESOURCE_URL)
+    MCP_RESOURCE_URL: normalizeResourceUrl(parsed.data.MCP_RESOURCE_URL),
+    // The metadata document publishes the issuer as new URL(issuer).href,
+    // which always carries a trailing slash on a bare origin. RFC 9207 has
+    // clients compare the "iss" we send back on the redirect against that
+    // string byte for byte, so both sides must be spelled the same way or a
+    // strict client silently drops the callback.
+    OAUTH_ISSUER_URL: new URL(parsed.data.OAUTH_ISSUER_URL).href
   };
   return cached;
 }
