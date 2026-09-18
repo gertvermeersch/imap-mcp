@@ -1,3 +1,4 @@
+import type { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { Config } from '../config.js';
@@ -26,6 +27,20 @@ export interface MessageDetail extends MessageSummary {
   body: string;
   bodyTruncated: boolean;
   attachments: Array<{ filename: string | undefined; contentType: string; sizeBytes: number }>;
+}
+
+/** A text part chosen out of BODYSTRUCTURE, addressed by its IMAP part number. */
+interface TextPart {
+  part: string;
+  type: string;
+}
+
+/** A rendered message body, however it was obtained. */
+interface RenderedBody {
+  text: string;
+  truncated: boolean;
+  /** Set only by the full-parse fallback, which already holds them. */
+  attachments?: MessageDetail['attachments'];
 }
 
 export class MailboxError extends Error {}
@@ -122,34 +137,49 @@ export class Mailbox {
     });
   }
 
+  /**
+   * Fetches one message without pulling its attachments over the wire: the
+   * envelope, structure and threading headers first, then only the text part
+   * the structure points at. A 25 MB message with a 3 kB body costs 3 kB.
+   */
   async getMessage(folder0: string, uid: number): Promise<MessageDetail> {
     const folder = this.assertAllowed(folder0);
     return this.conn.withFolder(folder, true, async (client) => {
       const msg = await client.fetchOne(
         String(uid),
-        { uid: true, envelope: true, flags: true, size: true, source: true, bodyStructure: true },
+        {
+          uid: true,
+          envelope: true,
+          flags: true,
+          size: true,
+          bodyStructure: true,
+          // References is what getThread walks, and the envelope omits it.
+          headers: ['references', 'in-reply-to']
+        },
         { uid: true }
       );
-      if (!msg || !msg.source) {
+      if (!msg) {
         throw new MailboxError(`No message with UID ${uid} in "${folder}"`);
       }
-      const parsed = await simpleParser(msg.source);
-      const text = parsed.text ?? this.stripHtml(parsed.html || '') ?? '';
-      const truncated = text.length > this.cfg.MAX_BODY_CHARS;
+
+      const textPart = this.pickTextPart(msg.bodyStructure);
+      const rendered = textPart
+        ? await this.downloadTextPart(client, uid, textPart)
+        : await this.parseWholeMessage(client, uid, folder);
+
+      const overCap = rendered.text.length > this.cfg.MAX_BODY_CHARS;
+      const bodyTruncated = overCap || rendered.truncated;
+      const text = overCap ? rendered.text.slice(0, this.cfg.MAX_BODY_CHARS) : rendered.text;
 
       return {
         ...this.toSummary(folder, msg),
         cc: addressText(msg.envelope?.cc),
         replyTo: addressText(msg.envelope?.replyTo),
         inReplyTo: msg.envelope?.inReplyTo ?? undefined,
-        references: this.normalizeReferences(parsed.references),
-        body: truncated ? `${text.slice(0, this.cfg.MAX_BODY_CHARS)}\n\n[truncated]` : text,
-        bodyTruncated: truncated,
-        attachments: (parsed.attachments ?? []).map((a) => ({
-          filename: a.filename,
-          contentType: a.contentType,
-          sizeBytes: a.size
-        }))
+        references: this.parseReferences(msg.headers),
+        body: bodyTruncated ? `${text}\n\n[truncated]` : text,
+        bodyTruncated,
+        attachments: rendered.attachments ?? this.collectAttachments(msg.bodyStructure)
       };
     });
   }
@@ -288,9 +318,135 @@ export class Mailbox {
     return false;
   }
 
-  private normalizeReferences(refs: string | string[] | undefined): string[] {
-    if (!refs) return [];
-    return Array.isArray(refs) ? refs : [refs];
+  /**
+   * Picks the part to render: the first inline text/plain, else the first
+   * inline text/html. Parts marked as attachments are skipped — a .txt
+   * attachment is not the body — and embedded messages are left alone so an
+   * attached .eml cannot masquerade as the text of the mail carrying it.
+   */
+  private pickTextPart(node: any): TextPart | undefined {
+    const candidates: TextPart[] = [];
+
+    const walk = (n: any): void => {
+      if (!n) return;
+      const type = String(n.type ?? '').toLowerCase();
+      if (n.disposition === 'attachment') return;
+      if (type.startsWith('message/')) return;
+      if (Array.isArray(n.childNodes) && n.childNodes.length > 0) {
+        for (const child of n.childNodes) walk(child);
+        return;
+      }
+      if (type === 'text/plain' || type === 'text/html') {
+        // A non-multipart message carries no part number on its root node;
+        // RFC 3501 addresses that body as part 1.
+        candidates.push({ part: n.part ?? '1', type });
+      }
+    };
+
+    walk(node);
+    return candidates.find((c) => c.type === 'text/plain') ?? candidates[0];
+  }
+
+  /**
+   * Streams a single body part. imapflow's maxBytes bounds the decoded output
+   * and stops the fetch loop once it is reached, so the cap is honoured on the
+   * wire rather than after the fact. Transfer encoding and non-UTF-8 charsets
+   * are decoded on the way through. The enclosing lock is read-only, so this
+   * still does not set \Seen.
+   */
+  private async downloadTextPart(
+    client: ImapFlow,
+    uid: number,
+    part: TextPart
+  ): Promise<RenderedBody> {
+    // Four bytes per character is the UTF-8 worst case, so nothing inside the
+    // character cap can be lost to the byte cap.
+    const maxBytes = this.cfg.MAX_BODY_CHARS * 4;
+    const { content } = await client.download(String(uid), part.part, { uid: true, maxBytes });
+
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of content) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      chunks.push(buf);
+      bytes += buf.length;
+    }
+
+    const raw = Buffer.concat(chunks).toString('utf8');
+    return {
+      text: part.type === 'text/html' ? this.stripHtml(raw) : raw,
+      truncated: bytes >= maxBytes
+    };
+  }
+
+  /**
+   * Fallback for messages whose structure offers no text part to download:
+   * malformed MIME, or a body described in a way the walk above does not
+   * recognise. Costs a full download, which is what this class otherwise
+   * avoids, but mailparser is far more forgiving than a hand walk.
+   */
+  private async parseWholeMessage(
+    client: ImapFlow,
+    uid: number,
+    folder: string
+  ): Promise<RenderedBody> {
+    const msg = await client.fetchOne(String(uid), { uid: true, source: true }, { uid: true });
+    if (!msg || !msg.source) {
+      throw new MailboxError(`No message with UID ${uid} in "${folder}"`);
+    }
+    const parsed = await simpleParser(msg.source);
+    return {
+      text: parsed.text ?? this.stripHtml(parsed.html || '') ?? '',
+      truncated: false,
+      attachments: (parsed.attachments ?? []).map((a) => ({
+        filename: a.filename,
+        contentType: a.contentType,
+        sizeBytes: a.size
+      }))
+    };
+  }
+
+  /** Attachment metadata read off the structure — no attachment bytes fetched. */
+  private collectAttachments(
+    node: any,
+    out: MessageDetail['attachments'] = []
+  ): MessageDetail['attachments'] {
+    if (!node) return out;
+    if (node.disposition === 'attachment') {
+      const size = typeof node.size === 'number' ? node.size : 0;
+      const encoding = String(node.encoding ?? '').toLowerCase();
+      out.push({
+        filename: node.dispositionParameters?.filename ?? node.parameters?.name,
+        contentType: String(node.type ?? 'application/octet-stream'),
+        // BODYSTRUCTURE reports encoded octets. base64 inflates by 4/3, and the
+        // decoded size is the one a human recognises as the file size.
+        sizeBytes: encoding === 'base64' ? Math.floor((size * 3) / 4) : size
+      });
+    }
+    for (const child of node.childNodes ?? []) this.collectAttachments(child, out);
+    return out;
+  }
+
+  /**
+   * Reads References out of a raw header block, unfolding continuation lines.
+   * Produces the same angle-bracketed ids mailparser did, which is the form
+   * getThread searches on and createDraft writes back into a References header.
+   */
+  private parseReferences(headers: Buffer | undefined): string[] {
+    if (!headers) return [];
+    const line = headers
+      .toString('utf8')
+      .replace(/\r?\n[ \t]+/g, ' ')
+      .split(/\r?\n/)
+      .find((l) => /^references:/i.test(l));
+    if (!line) return [];
+    return line
+      .slice(line.indexOf(':') + 1)
+      .split(/\s+/)
+      .map((id) => id.trim())
+      .filter(Boolean)
+      .map((id) => (id.startsWith('<') ? id : `<${id}`))
+      .map((id) => (id.endsWith('>') ? id : `${id}>`));
   }
 
   private stripHtml(html: string): string {

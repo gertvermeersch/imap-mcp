@@ -14,10 +14,13 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { hashPassword } from '../dist/auth/password.js';
 
 const JAR = process.env.GREENMAIL_JAR;
+/** Repo root, so the suite runs from wherever it is checked out. */
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const IMAP_PORT = 3143;
 const SMTP_PORT = 3025;
 const APP_PORT = 8791;
@@ -164,7 +167,7 @@ try {
 
   console.log('Starting imap-mcp...');
   app = spawn('node', ['dist/index.js'], {
-    cwd: '/home/claude/imap-mcp',
+    cwd: ROOT,
     env: {
       ...process.env,
       MCP_RESOURCE_URL: RESOURCE,
@@ -431,7 +434,7 @@ try {
   // === 7. Folder allowlist =================================================
   console.log('\nFolder allowlist (separate instance)');
   const restricted = spawn('node', ['dist/index.js'], {
-    cwd: '/home/claude/imap-mcp',
+    cwd: ROOT,
     env: {
       ...process.env,
       MCP_RESOURCE_URL: `http://127.0.0.1:${APP_PORT + 1}/mcp`,

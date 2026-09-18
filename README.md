@@ -120,10 +120,20 @@ npm run build && npm run test:auth
 
 22 checks; all should pass.
 
+`test/body-parts.mjs` unit-tests the structure walks behind `get_message` — which body part to render, which nodes are attachments, and how `References` is parsed — against BODYSTRUCTURE fixtures. No server at all:
+
+```bash
+npm run build && npm run test:body
+```
+
+24 checks; all should pass. The `References` cases assert byte-for-byte agreement with what `mailparser` produced from the full source, because threading depends on that format not shifting.
+
 Two behaviours the tests pinned down, worth knowing if you extend the search tool:
 
 - Message search uses `HEADER from`/`HEADER to` rather than the bare `FROM`/`TO` keys. `HEADER` is substring matching on every RFC 3501 server; the bare keys are interpreted more loosely by some (GreenMail matches whole addresses only).
 - `APPEND` to a missing Drafts folder returns `TRYCREATE`. The server creates the folder and retries once, so a renamed or localised Drafts doesn't break drafting.
+
+`get_message` does not download the message. It fetches `BODYSTRUCTURE` plus the threading headers, picks the first inline `text/plain` (falling back to `text/html`), and streams only that part with a byte cap — so a 25 MB mail with a 3 kB body costs 3 kB, and attachment metadata is read off the structure without fetching a single attachment byte. Messages whose structure offers no renderable text part fall back to the old full-source parse, which is slower but copes with malformed MIME.
 
 ## Protocol version
 
