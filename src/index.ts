@@ -66,37 +66,6 @@ app.use(
   }
 );
 
-/**
- * RFC 9728 puts protected-resource metadata at a path-specific well-known URL,
- * and mcpAuthRouter serves exactly that: /.well-known/oauth-protected-resource
- * /mcp. Clients that don't implement the path-insertion rule ask for the bare
- * /.well-known/oauth-protected-resource instead, get a 404, and fall back to
- * guessing the resource indicator from our origin — which then fails the
- * audience check at /token. Serving the same document at the root costs
- * nothing and lets those clients read the canonical value instead of guessing.
- */
-const protectedResourceMetadata = {
-  resource: cfg.MCP_RESOURCE_URL,
-  authorization_servers: [cfg.OAUTH_ISSUER_URL],
-  scopes_supported: supportedScopes(cfg),
-  resource_name: `IMAP mailbox (${cfg.IMAP_USER})`
-};
-
-app.all('/.well-known/oauth-protected-resource', (req, res) => {
-  // Same CORS posture as the SDK's own metadata routes: readable by any origin.
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Headers', 'mcp-protocol-version');
-  if (req.method === 'OPTIONS') {
-    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS').status(204).end();
-    return;
-  }
-  if (req.method !== 'GET') {
-    res.set('Allow', 'GET, OPTIONS').status(405).end();
-    return;
-  }
-  res.status(200).json(protectedResourceMetadata);
-});
-
 // OAuth 2.1 authorization server + protected resource metadata. Must be
 // mounted at the application root: the .well-known paths are absolute.
 app.use(
