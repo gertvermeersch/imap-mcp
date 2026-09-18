@@ -26,8 +26,8 @@ const SMTP_PORT = 3025;
 const APP_PORT = 8791;
 const ORIGIN = `http://127.0.0.1:${APP_PORT}`;
 const RESOURCE = `${ORIGIN}/mcp`;
-const OPERATOR = { username: 'gert', password: 'correct-horse-battery' };
-const MAILBOX = { user: 'gert@stormlabs.test', pass: 'imap-secret' };
+const OPERATOR = { username: 'operator', password: 'correct-horse-battery' };
+const MAILBOX = { user: 'mailbox@example.test', pass: 'imap-secret' };
 
 let passed = 0;
 let failed = 0;
@@ -145,7 +145,7 @@ try {
     from: 'Ilse Peeters <ilse@klant.test>',
     to: MAILBOX.user,
     subject: 'Offerte webshop — akkoord?',
-    text: 'Dag Gert, kunnen we de offerte deze week bevestigen? Groeten, Ilse',
+    text: 'Dag An, kunnen we de offerte deze week bevestigen? Groeten, Ilse',
     messageId: rootId
   });
   await smtp.sendMail({

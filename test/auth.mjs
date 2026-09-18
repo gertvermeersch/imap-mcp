@@ -18,7 +18,7 @@ import { hashPassword } from '../dist/auth/password.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const REDIRECT = 'http://127.0.0.1:9999/callback';
-const OPERATOR = { username: 'gert', password: 'correct-horse-battery' };
+const OPERATOR = { username: 'operator', password: 'correct-horse-battery' };
 
 let passed = 0;
 let failed = 0;
@@ -56,7 +56,7 @@ async function startServer(port, extraEnv) {
       IMAP_HOST: '127.0.0.1',
       IMAP_PORT: '1',
       IMAP_SECURE: 'false',
-      IMAP_USER: 'gert@stormlabs.test',
+      IMAP_USER: 'mailbox@example.test',
       IMAP_PASSWORD: 'unused',
       ...extraEnv
     },

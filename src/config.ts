@@ -38,7 +38,7 @@ const schema = z.object({
   /** Directory for registered clients and refresh tokens. Mount a volume. */
   STATE_DIR: z.string().default('/data'),
 
-  // --- IMAP (Mailcow on Aether, reached over the private subnet) -----------
+  // --- IMAP (Mailcow, reached over the private subnet) ---------------------
   IMAP_HOST: z.string().min(1),
   IMAP_PORT: z.coerce.number().int().positive().default(993),
   /** true for implicit TLS on 993, false for STARTTLS on 143. */
@@ -47,7 +47,7 @@ const schema = z.object({
     .default('true')
     .transform((v) => v !== 'false'),
   /**
-   * Set false only if Aether presents a cert that does not match the private
+   * Set false only if your mail server presents a cert that does not match the private
    * subnet hostname you connect to. Prefer fixing the cert or using the name
    * on it — this is a real downgrade.
    */

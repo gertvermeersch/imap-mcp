@@ -9,7 +9,7 @@ services:
       - imap-mcp-state:/data
     networks:
       - traefik
-      # The IMAP host lives on Aether, reached over the private subnet. Attach
+      # The IMAP host lives on your mail server, reached over the private subnet. Attach
       # whichever network gives this container that route (WireGuard on the
       # host, or a shared Docker network). Nothing here exposes IMAP publicly.
       - mail

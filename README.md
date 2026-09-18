@@ -2,10 +2,10 @@
 
 A remote MCP server that gives Claude **read + draft** access to one IMAP mailbox, authenticated with OAuth 2.1.
 
-Built to sit beside the Dolibarr MCP: TypeScript, Docker, Traefik. It runs on **Odin** and reaches Mailcow on **Aether** across the private subnet, so IMAP itself is never exposed to the internet — only this server's HTTPS endpoint is.
+Built to sit behind Traefik reverse proxy: TypeScript, Docker, Traefik. So IMAP itself is never exposed to the internet — only this server's HTTPS endpoint is.
 
 ```
-claude.ai ──HTTPS/OAuth──▶ imap-mcp (Odin) ──IMAP/TLS, private subnet──▶ Mailcow (Aether)
+claude.ai ──HTTPS/OAuth──▶ imap-mcp (VPS) ──IMAP/TLS, private subnet──▶ Mailcow (mail host)
 ```
 
 ## What it can and cannot do
@@ -33,13 +33,13 @@ Two switches tighten it further:
 - **Refresh token rotation**, single-use authorization codes (60s), `iss` in the callback per RFC 9207.
 - **Scopes are enforced, not just advertised.** `mail:read` gates the endpoint; `create_draft` additionally checks `mail:draft` on every call. A client that asks for read-only gets a token that cannot draft. With `ENABLE_DRAFTS=false` the scope is not advertised or grantable at all.
 - **Sign-in throttling.** Five wrong passwords burn the authorization request, so further guesses cost a fresh `/authorize` round trip. Five failures from one address — or twenty across all addresses — lock the login form for 15 minutes with a `429` and a `Retry-After`. The counters are in memory and reset on restart.
-- The mailbox password lives only in the container env. It is never returned by a tool, never rendered in the login page, and never leaves Odin.
+- The mailbox password lives only in the container env. It is never returned by a tool, never rendered in the login page, and never leaves the server.
 
 Give it a **dedicated Mailcow app password**, not your main one. If the mailbox supports it, a separate read-only IMAP user is better still.
 
-## Deploy on Odin
+## Deployment
 
-**1. Create the mailbox credential on Aether.** In Mailcow, add an app password for the mailbox scoped to IMAP only. Note the private-subnet hostname Odin uses to reach Aether — it must match the TLS certificate, or you will be tempted to set `IMAP_TLS_REJECT_UNAUTHORIZED=false`, which you should not do.
+**1. Create the mailbox credential.** In Mailcow, add an app password for the mailbox scoped to IMAP only. Note the private-subnet hostname you connect with — it must match the TLS certificate, or you will be tempted to set `IMAP_TLS_REJECT_UNAUTHORIZED=false`, which you should not do.
 
 **2. Configure.**
 
@@ -88,7 +88,7 @@ The second call should echo your `MCP_RESOURCE_URL` back as `resource`. If it do
 
 ## Network notes
 
-- The container needs a route to Aether's IMAP. Attach it to whichever Docker network or host WireGuard interface provides that; the compose file assumes an external network named `mail`.
+- The container needs a route to your Mailcow instance's IMAP. Attach it to whichever Docker network or host WireGuard interface provides that; the compose file assumes an external network named `mail`.
 - Anthropic reaches the endpoint from published IP ranges. If you want a second layer, add a Traefik `IPAllowList` middleware for those ranges — but know that if they change, the 07:00 task fails silently until you notice. OAuth alone is the lower-maintenance choice.
 
 ## Development
