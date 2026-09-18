@@ -1,0 +1,56 @@
+services:
+  imap-mcp:
+    build: .
+    image: imap-mcp:0.1.0
+    container_name: imap-mcp
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - imap-mcp-state:/data
+    networks:
+      - traefik
+      # The IMAP host lives on Aether, reached over the private subnet. Attach
+      # whichever network gives this container that route (WireGuard on the
+      # host, or a shared Docker network). Nothing here exposes IMAP publicly.
+      - mail
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+
+      - traefik.http.routers.imap-mcp.rule=Host(`${MCP_HOST}`)
+      - traefik.http.routers.imap-mcp.entrypoints=websecure
+      - traefik.http.routers.imap-mcp.tls=true
+      - traefik.http.routers.imap-mcp.tls.certresolver=letsencrypt
+      - traefik.http.routers.imap-mcp.service=imap-mcp
+      - traefik.http.services.imap-mcp.loadbalancer.server.port=8080
+
+      # ---------------------------------------------------------------------
+      # The HTTP/2 trap that bit the Dolibarr MCP: some MCP clients hold a GET
+      # stream open, and Traefik's h2c multiplexing mangles it. Pin this router
+      # to HTTP/1.1 by advertising only http/1.1 in ALPN on its TLS options.
+      # Define the named option once in your static/dynamic config:
+      #
+      #   tls:
+      #     options:
+      #       http1only:
+      #         alpnProtocols:
+      #           - http/1.1
+      # ---------------------------------------------------------------------
+      - traefik.http.routers.imap-mcp.tls.options=http1only@file
+
+      # Security headers. The login page is the only HTML this server serves.
+      - traefik.http.middlewares.imap-mcp-sec.headers.stsSeconds=31536000
+      - traefik.http.middlewares.imap-mcp-sec.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.imap-mcp-sec.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.imap-mcp-sec.headers.frameDeny=true
+      - traefik.http.middlewares.imap-mcp-sec.headers.referrerPolicy=no-referrer
+      - traefik.http.routers.imap-mcp.middlewares=imap-mcp-sec
+
+volumes:
+  imap-mcp-state:
+
+networks:
+  traefik:
+    external: true
+  mail:
+    external: true
