@@ -28,15 +28,43 @@ app.set('trust proxy', 1);
 const resourceUrl = new URL(cfg.MCP_RESOURCE_URL);
 
 /**
- * One line per OAuth endpoint hit. Different clients give up at different
- * points in the flow and most of them say nothing about why, so the server log
- * is the only place the sequence is visible: metadata -> register -> authorize
- * -> token. A flow that stops after /authorize never came back for a token.
+ * One line per connector request, with the status and — on a failure — the
+ * error body the client received. Different clients give up at different points
+ * in the flow and most of them say nothing about why, so the server log is the
+ * only place the sequence is visible: metadata -> register -> authorize ->
+ * token -> mcp. A flow that stops after /token never reached the transport; one
+ * that reaches /mcp and gets 406 sent the wrong Accept header.
  */
-app.use(['/.well-known', '/register', '/authorize', '/token', '/revoke'], (req, _res, next) => {
-  console.log(`[oauth] ${req.method} ${req.originalUrl.split('?')[0]} ua=${req.get('user-agent') ?? '-'}`);
-  next();
-});
+app.use(
+  ['/.well-known', '/register', '/authorize', '/token', '/revoke', '/mcp'],
+  (req, res, next) => {
+    const path = req.originalUrl.split('?')[0];
+    // The OAuth handlers and the transport both report failures via res.json,
+    // so wrapping it is enough to capture every error body we hand back.
+    const sendJson = res.json.bind(res);
+    let body: unknown;
+    res.json = ((payload: unknown) => {
+      body = payload;
+      return sendJson(payload);
+    }) as typeof res.json;
+
+    res.on('finish', () => {
+      const parts = [`[trace] ${req.method} ${path} -> ${res.statusCode}`];
+      // Only meaningful on /mcp, and only once express.json has run.
+      const rpc = (req.body as { method?: string } | undefined)?.method;
+      if (rpc) parts.push(`rpc=${rpc}`);
+      if (path === '/mcp') parts.push(`accept=${req.get('accept') ?? '-'}`);
+      if (res.statusCode >= 400) {
+        const auth = res.get('WWW-Authenticate');
+        if (auth) parts.push(`www-authenticate=${auth}`);
+        if (body !== undefined) parts.push(JSON.stringify(body));
+      }
+      console.log(parts.join(' '));
+    });
+
+    next();
+  }
+);
 
 // OAuth 2.1 authorization server + protected resource metadata. Must be
 // mounted at the application root: the .well-known paths are absolute.
@@ -126,7 +154,14 @@ const bearer = requireBearerAuth({
  */
 app.post('/mcp', bearer, express.json({ limit: '4mb' }), async (req, res) => {
   const server = buildMcpServer(cfg, mailbox);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  // enableJsonResponse makes a request/response exchange come back as plain
+  // application/json instead of a one-event SSE stream. Both are legal
+  // Streamable HTTP, but JSON is what the stricter clients cope with, and this
+  // server never pushes anything mid-request that a stream would be needed for.
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true
+  });
 
   res.on('close', () => {
     void transport.close();
