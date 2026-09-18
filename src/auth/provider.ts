@@ -260,11 +260,17 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
   private assertResourceMatches(resource: string | undefined): void {
     if (!resource) return; // Client omitted it; audience still pinned on issue.
     const normalized = resource.replace(/\/$/, '');
-    if (normalized !== this.cfg.MCP_RESOURCE_URL) {
-      throw new InvalidGrantError(
-        `Token requested for resource ${resource}, which is not this server`
-      );
-    }
+    if (normalized === this.cfg.MCP_RESOURCE_URL) return;
+    // Some clients derive the resource indicator from the server's origin
+    // instead of reading it out of the protected-resource metadata, so
+    // https://host arrives where https://host/mcp was advertised. That still
+    // names this server and nothing else, and the audience baked into the
+    // token is the canonical URL either way — see issueTokens — so the
+    // shorter spelling is accepted rather than failing the exchange.
+    if (normalized === new URL(this.cfg.MCP_RESOURCE_URL).origin) return;
+    throw new InvalidGrantError(
+      `Token requested for resource ${resource}, which is not this server`
+    );
   }
 
   private async issueTokens(
