@@ -74,7 +74,7 @@ export function renderLoginPage(opts: {
       <button type="submit">Authorize</button>
     </form>
     <p class="mailbox">Mailbox: <code>${escapeHtml(opts.mailbox)}</code><br>
-    This grant can read and draft. It can never send or delete.</p>
+    ${opts.scopes.includes('mail:draft') ? 'This grant can read and draft.' : 'This grant is read-only.'} It can never send or delete.</p>
   </main>
 </body>
 </html>`;

@@ -141,18 +141,36 @@ app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async 
   res.set('Cache-Control', 'no-store').redirect(302, result.redirectTo);
 });
 
-const bearer = requireBearerAuth({
-  verifier: provider,
-  requiredScopes: ['mail:read'],
-  resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceUrl)
-});
+const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
+
+// requiredScopes is deliberately left empty. The SDK copies it into the scope=
+// parameter of every 401 challenge, and clients treat that parameter as the
+// scope to request — so naming mail:read there made Claude ask for read access
+// only, and the operator was never offered mail:draft. Without it clients fall
+// back to scopes_supported from the metadata, which lists everything on offer.
+const bearer = requireBearerAuth({ verifier: provider, resourceMetadataUrl });
+
+/** Every token must carry mail:read; the challenge names all scopes on offer so a step-up can ask for drafts too. */
+const requireRead: express.RequestHandler = (req, res, next) => {
+  if ((req as express.Request & { auth?: { scopes: string[] } }).auth?.scopes.includes('mail:read')) {
+    next();
+    return;
+  }
+  res
+    .set(
+      'WWW-Authenticate',
+      `Bearer error="insufficient_scope", error_description="Insufficient scope", scope="${supportedScopes(cfg).join(' ')}", resource_metadata="${resourceMetadataUrl}"`
+    )
+    .status(403)
+    .json({ error: 'insufficient_scope', error_description: 'Insufficient scope' });
+};
 
 /**
  * Stateless MCP endpoint: a fresh server and transport per request, no session
  * IDs. That matches where the protocol is heading and means Traefik can restart
  * or round-robin this container without breaking a connector mid-conversation.
  */
-app.post('/mcp', bearer, express.json({ limit: '4mb' }), async (req, res) => {
+app.post('/mcp', bearer, requireRead, express.json({ limit: '4mb' }), async (req, res) => {
   const server = buildMcpServer(cfg, mailbox);
   // enableJsonResponse makes a request/response exchange come back as plain
   // application/json instead of a one-event SSE stream. Both are legal

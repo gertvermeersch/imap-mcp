@@ -205,6 +205,16 @@ async function draftsEnabled() {
       JSON.stringify(meta.scopes_supported)
     );
 
+    // Clients request whatever scope the 401 challenge names, so it must not
+    // single out mail:read or they never ask for drafts.
+    const challenge = await fetch(`${srv.origin}/mcp`, { method: 'POST' });
+    const wwwAuth = challenge.headers.get('www-authenticate') ?? '';
+    check(
+      'unauthenticated challenge does not narrow the scope to mail:read',
+      challenge.status === 401 && !/scope="mail:read"/.test(wwwAuth),
+      wwwAuth
+    );
+
     // A client may narrow itself to read-only; the consent page must say so.
     const auth = await c.startAuth(client.client_id, 'mail:read');
     check('login page renders for a read-only request', !!auth.requestId);
