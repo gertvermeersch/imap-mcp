@@ -1,12 +1,14 @@
 services:
   imap-mcp:
     build: .
-    image: imap-mcp:0.1.0
+    image: imap-mcp:0.2.0
     container_name: imap-mcp
     restart: unless-stopped
     env_file: .env
     volumes:
       - imap-mcp-state:/data
+      # Only with several mailboxes (MAILBOXES_CONFIG=/config/mailboxes.yml).
+      # - ./mailboxes.yml:/config/mailboxes.yml:ro
     networks:
       - traefik
       # The IMAP host lives on your mail server, reached over the private subnet. Attach

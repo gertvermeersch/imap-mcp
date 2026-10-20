@@ -3,17 +3,19 @@
  *
  * Unlike test/smoke.mjs this needs no IMAP server and no Java — every path it
  * exercises is refused before the mailbox is ever touched. It boots the real
- * dist/index.js twice, once with drafts enabled and once without, and drives
+ * dist/index.js in several configurations — one mailbox from env with various
+ * switches off, and three mailboxes from a MAILBOXES_CONFIG file — and drives
  * the OAuth flow the way a client does.
  *
  * Usage: node test/auth.mjs   (expects a built dist/)
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SignJWT } from 'jose';
 import { hashPassword } from '../dist/auth/password.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -41,6 +43,7 @@ const s256 = (v) => createHash('sha256').update(v).digest('base64url');
 /** Boots dist/index.js on `port` and resolves once /healthz answers. */
 async function startServer(port, extraEnv) {
   const stateDir = await mkdtemp(join(tmpdir(), 'imap-mcp-auth-'));
+  const jwtSecret = randomBytes(48).toString('base64');
   const child = spawn(process.execPath, ['dist/index.js'], {
     cwd: ROOT,
     env: {
@@ -51,7 +54,7 @@ async function startServer(port, extraEnv) {
       STATE_DIR: stateDir,
       OPERATOR_USERNAME: OPERATOR.username,
       OPERATOR_PASSWORD_HASH: await hashPassword(OPERATOR.password),
-      JWT_SECRET: randomBytes(48).toString('base64'),
+      JWT_SECRET: jwtSecret,
       // Never contacted: every assertion here is refused before IMAP.
       IMAP_HOST: '127.0.0.1',
       IMAP_PORT: '1',
@@ -73,6 +76,7 @@ async function startServer(port, extraEnv) {
         return {
           origin,
           resource: `${origin}/mcp`,
+          jwtSecret,
           async stop() {
             child.kill('SIGTERM');
             await sleep(400);
@@ -165,6 +169,27 @@ function api(srv) {
   };
 }
 
+/** Mints an access token the way the server does, for scopes the flow cannot produce (legacy ones). */
+function mint(srv, scope) {
+  return new SignJWT({ scope })
+    .setProtectedHeader({ alg: 'HS256', typ: 'at+jwt' })
+    .setIssuer(`${srv.origin}/`)
+    .setSubject(OPERATOR.username)
+    .setAudience(srv.resource)
+    .setIssuedAt()
+    .setExpirationTime('1h')
+    .sign(new TextEncoder().encode(srv.jwtSecret));
+}
+
+const text = (r) => r?.result?.content?.[0]?.text ?? '';
+const json = (r) => {
+  try {
+    return JSON.parse(text(r));
+  } catch {
+    return undefined;
+  }
+};
+
 let rpcId = 0;
 async function rpc(srv, token, method, params) {
   const res = await fetch(srv.resource, {
@@ -191,6 +216,8 @@ async function rpc(srv, token, method, params) {
 
 // ---------------------------------------------------------------------------
 
+const ALL = ['mail:read:mailbox', 'mail:draft:mailbox', 'mail:mark:mailbox', 'mail:move:mailbox'];
+
 async function draftsEnabled() {
   console.log('\nDrafts enabled — scope enforcement');
   const srv = await startServer(8793, { ALLOWED_FOLDERS: 'INBOX,Drafts', ENABLE_DRAFTS: 'true' });
@@ -203,9 +230,8 @@ async function draftsEnabled() {
       await fetch(`${srv.origin}/.well-known/oauth-authorization-server`)
     ).json();
     check(
-      'metadata advertises every scope',
-      JSON.stringify(meta.scopes_supported) ===
-        JSON.stringify(['mail:read', 'mail:draft', 'mail:mark', 'mail:move']),
+      'metadata advertises every scope, named for the mailbox',
+      JSON.stringify(meta.scopes_supported) === JSON.stringify(ALL),
       JSON.stringify(meta.scopes_supported)
     );
 
@@ -215,24 +241,24 @@ async function draftsEnabled() {
     const wwwAuth = challenge.headers.get('www-authenticate') ?? '';
     check(
       'unauthenticated challenge does not narrow the scope to mail:read',
-      challenge.status === 401 && !/scope="mail:read"/.test(wwwAuth),
+      challenge.status === 401 && !/scope="mail:read(:mailbox)?"/.test(wwwAuth),
       wwwAuth
     );
 
     // A client may narrow itself to read-only; the consent page must say so.
-    const auth = await c.startAuth(client.client_id, 'mail:read');
+    const auth = await c.startAuth(client.client_id, 'mail:read:mailbox');
     check('login page renders for a read-only request', !!auth.requestId);
     check(
       'consent page lists only the read scope',
-      auth.html.includes('mail:read') && !auth.html.includes('mail:draft')
+      auth.html.includes('mail:read:mailbox') && !auth.html.includes('mail:draft')
     );
 
-    const login = await c.login(auth.requestId, OPERATOR.password);
+    const login = await c.login(auth.requestId, OPERATOR.password, ['mail:read:mailbox']);
     check('correct password redirects with a code', login.status === 302, `status ${login.status}`);
     const code = new URL(login.headers.get('location')).searchParams.get('code');
 
     const tok = await c.token(client.client_id, code, auth.verifier);
-    check('token carries the narrowed scope', tok.scope === 'mail:read', JSON.stringify(tok.scope));
+    check('token carries the narrowed scope', tok.scope === 'mail:read:mailbox', JSON.stringify(tok.scope));
 
     await rpc(srv, tok.access_token, 'initialize', {
       protocolVersion: '2025-06-18',
@@ -258,8 +284,8 @@ async function draftsEnabled() {
     );
 
     for (const [name, scope, args] of [
-      ['mark_messages', 'mail:mark', { uids: [1], seen: true }],
-      ['move_messages', 'mail:move', { uids: [1], destination: 'Drafts' }]
+      ['mark_messages', 'mail:mark:mailbox', { uids: [1], seen: true }],
+      ['move_messages', 'mail:move:mailbox', { uids: [1], destination: 'Drafts' }]
     ]) {
       check(
         `${name} is listed`,
@@ -275,8 +301,11 @@ async function draftsEnabled() {
     }
 
     // A grant of one write scope must not unlock the others.
-    const markOnly = await c.startAuth(client.client_id, 'mail:read mail:mark');
-    const markLogin = await c.login(markOnly.requestId, OPERATOR.password, ['mail:mark']);
+    const markOnly = await c.startAuth(client.client_id, 'mail:read:mailbox mail:mark:mailbox');
+    const markLogin = await c.login(markOnly.requestId, OPERATOR.password, [
+      'mail:read:mailbox',
+      'mail:mark:mailbox'
+    ]);
     const markCode = new URL(markLogin.headers.get('location')).searchParams.get('code');
     const markTok = await c.token(client.client_id, markCode, markOnly.verifier);
     const markMoveDenied = await rpc(srv, markTok.access_token, 'tools/call', {
@@ -286,7 +315,7 @@ async function draftsEnabled() {
     check(
       'mail:mark does not grant move_messages',
       markMoveDenied.result?.isError === true &&
-        (markMoveDenied.result?.content?.[0]?.text ?? '').includes('mail:move')
+        (markMoveDenied.result?.content?.[0]?.text ?? '').includes('mail:move:mailbox')
     );
     const markAllowed = await rpc(srv, markTok.access_token, 'tools/call', {
       name: 'mark_messages',
@@ -313,7 +342,34 @@ async function draftsEnabled() {
     const scopeless = await c.startAuth(client.client_id, undefined);
     check(
       'a scopeless request is offered everything on offer',
-      ['mail:read', 'mail:draft', 'mail:mark', 'mail:move'].every((s) => scopeless.html.includes(s))
+      ALL.every((s) => scopeless.html.includes(s))
+    );
+
+    const legacy = await c.startAuth(client.client_id, 'mail:read mail:draft');
+    check(
+      'a legacy unqualified request is offered those capabilities on the mailbox',
+      legacy.html.includes('value="mail:read:mailbox"') &&
+        legacy.html.includes('value="mail:draft:mailbox"') &&
+        !legacy.html.includes('mail:mark'),
+      legacy.res.status
+    );
+
+    // Tokens from before scopes named a mailbox must keep working after the upgrade.
+    const old = await mint(srv, 'mail:read mail:mark');
+    const oldDenied = await rpc(srv, old, 'tools/call', {
+      name: 'move_messages',
+      arguments: { uids: [1], destination: 'Drafts' }
+    });
+    const oldAllowed = await rpc(srv, old, 'tools/call', {
+      name: 'mark_messages',
+      arguments: { uids: [1], seen: true }
+    });
+    check(
+      'a legacy mail:read mail:mark token still reads and marks, and still cannot move',
+      oldAllowed.result?.isError === true &&
+        !text(oldAllowed).includes('scope') &&
+        text(oldDenied).includes('mail:move:mailbox'),
+      `${text(oldAllowed).slice(0, 80)} / ${text(oldDenied).slice(0, 80)}`
     );
 
     console.log('\nDrafts enabled — operator picks the scopes');
@@ -323,27 +379,37 @@ async function draftsEnabled() {
       const cd = new URL(l.headers.get('location')).searchParams.get('code');
       return (await c.token(client.client_id, cd, a.verifier)).scope;
     };
-    const everything = await c.startAuth(client.client_id, 'mail:read mail:draft mail:mark mail:move');
+    const everything = await c.startAuth(client.client_id, ALL.join(' '));
     check(
       'consent page has a checkbox per requested scope',
       (everything.html.match(/type="checkbox" name="scope"/g) ?? []).length === 4
     );
-    check('mail:read cannot be unticked', /value="mail:read" checked disabled/.test(everything.html));
     check(
-      'ticking a subset narrows the grant',
-      (await pick('mail:read mail:draft mail:mark mail:move', ['mail:mark'])) === 'mail:read mail:mark'
+      'every scope starts ticked',
+      ALL.every((s) => everything.html.includes(`value="${s}" checked`))
     );
     check(
-      'ticking nothing still grants mail:read, and nothing else',
-      (await pick('mail:read mail:draft mail:mark mail:move', [])) === 'mail:read'
+      'ticking a subset narrows the grant',
+      (await pick(ALL.join(' '), ['mail:read:mailbox', 'mail:mark:mailbox'])) === 'mail:read:mailbox mail:mark:mailbox'
     );
     check(
       'a scope the client never asked for cannot be added by the form',
-      (await pick('mail:read', ['mail:move', 'mail:draft'])) === 'mail:read'
+      (await pick('mail:read:mailbox', ['mail:read:mailbox', 'mail:move:mailbox', 'mail:draft:mailbox'])) ===
+        'mail:read:mailbox'
     );
 
+    const empty = await c.startAuth(client.client_id, ALL.join(' '));
+    const emptyLogin = await c.login(empty.requestId, OPERATOR.password, ['mail:mark:mailbox']);
+    check(
+      'a grant without read on any mailbox is refused',
+      emptyLogin.status === 401 && (await emptyLogin.text()).includes('at least one mailbox'),
+      `status ${emptyLogin.status}`
+    );
+    const retry = await c.login(empty.requestId, OPERATOR.password, ['mail:read:mailbox']);
+    check('...without burning the request: ticking read then succeeds', retry.status === 302, `status ${retry.status}`);
+
     console.log('\nDrafts enabled — login throttling');
-    const target = await c.startAuth(client.client_id, 'mail:read');
+    const target = await c.startAuth(client.client_id, 'mail:read:mailbox');
     for (let i = 1; i <= 5; i++) {
       const res = await c.login(target.requestId, `wrong-${i}`);
       const body = await res.text();
@@ -373,8 +439,8 @@ async function draftsEnabled() {
 
     // The lock is on the address, so a fresh authorization request does not
     // reset it — otherwise the throttle would be trivially bypassed.
-    const fresh = await c.startAuth(client.client_id, 'mail:read');
-    const stillBlocked = await c.login(fresh.requestId, OPERATOR.password);
+    const fresh = await c.startAuth(client.client_id, 'mail:read:mailbox');
+    const stillBlocked = await c.login(fresh.requestId, OPERATOR.password, ['mail:read:mailbox']);
     check(
       'a fresh request from the same address is still throttled',
       stillBlocked.status === 429,
@@ -397,24 +463,27 @@ async function draftsDisabled() {
     ).json();
     check(
       'metadata no longer advertises mail:draft',
-      JSON.stringify(meta.scopes_supported) === JSON.stringify(['mail:read', 'mail:mark', 'mail:move']),
+      JSON.stringify(meta.scopes_supported) ===
+        JSON.stringify(['mail:read:mailbox', 'mail:mark:mailbox', 'mail:move:mailbox']),
       JSON.stringify(meta.scopes_supported)
     );
 
-    const asked = await c.startAuth(client.client_id, 'mail:draft');
-    const location = asked.res.headers.get('location') ?? '';
-    check(
-      'requesting mail:draft is an invalid_scope error',
-      asked.res.status === 302 && location.includes('error=invalid_scope'),
-      `${asked.res.status} ${location.slice(0, 160)}`
-    );
+    for (const scope of ['mail:draft', 'mail:draft:mailbox']) {
+      const asked = await c.startAuth(client.client_id, scope);
+      const location = asked.res.headers.get('location') ?? '';
+      check(
+        `requesting ${scope} is an invalid_scope error`,
+        asked.res.status === 302 && location.includes('error=invalid_scope'),
+        `${asked.res.status} ${location.slice(0, 160)}`
+      );
+    }
 
     const scopeless = await c.startAuth(client.client_id, undefined);
     check(
       'a scopeless request is offered everything except mail:draft',
-      scopeless.html.includes('mail:read') &&
-        scopeless.html.includes('mail:mark') &&
-        scopeless.html.includes('mail:move') &&
+      scopeless.html.includes('mail:read:mailbox') &&
+        scopeless.html.includes('mail:mark:mailbox') &&
+        scopeless.html.includes('mail:move:mailbox') &&
         !scopeless.html.includes('mail:draft')
     );
   } finally {
@@ -434,7 +503,7 @@ async function writesDisabled() {
     ).json();
     check(
       'metadata advertises read and draft only',
-      JSON.stringify(meta.scopes_supported) === JSON.stringify(['mail:read', 'mail:draft']),
+      JSON.stringify(meta.scopes_supported) === JSON.stringify(['mail:read:mailbox', 'mail:draft:mailbox']),
       JSON.stringify(meta.scopes_supported)
     );
 
@@ -449,7 +518,7 @@ async function writesDisabled() {
     }
 
     const auth = await c.startAuth(client.client_id, undefined);
-    const login = await c.login(auth.requestId, OPERATOR.password);
+    const login = await c.login(auth.requestId, OPERATOR.password, ['mail:read:mailbox']);
     const code = new URL(login.headers.get('location')).searchParams.get('code');
     const tok = await c.token(client.client_id, code, auth.verifier);
     await rpc(srv, tok.access_token, 'initialize', {
@@ -469,9 +538,232 @@ async function writesDisabled() {
   }
 }
 
+const MAILBOXES_YAML = `
+mailboxes:
+  gert:
+    address: gert@example.test
+    passwordEnv: PW_GERT
+    capabilities: [read, draft, mark, move]
+  info:
+    address: info@example.test
+    passwordEnv: PW_INFO
+    capabilities: [read, draft]
+  agent:
+    address: agent@example.test
+    name: Example Agent
+    passwordEnv: PW_AGENT
+    capabilities: [read, draft, send]
+    send:
+      recipients: reply-only
+      maxPerDay: 2
+`;
+
+async function multiMailbox() {
+  console.log('\nThree mailboxes from MAILBOXES_CONFIG — scopes per mailbox');
+  const dir = await mkdtemp(join(tmpdir(), 'imap-mcp-mbx-'));
+  const file = join(dir, 'mailboxes.yml');
+  await writeFile(file, MAILBOXES_YAML);
+  const srv = await startServer(8796, {
+    MAILBOXES_CONFIG: file,
+    PW_GERT: 'unused',
+    PW_INFO: 'unused',
+    PW_AGENT: 'unused',
+    SMTP_HOST: '127.0.0.1',
+    SMTP_PORT: '1'
+  });
+  const c = api(srv);
+  try {
+    const client = await c.register('auth-test-multi');
+    const meta = await (await fetch(`${srv.origin}/.well-known/oauth-authorization-server`)).json();
+    const expected = [
+      'mail:read:gert', 'mail:draft:gert', 'mail:mark:gert', 'mail:move:gert',
+      'mail:read:info', 'mail:draft:info',
+      'mail:read:agent', 'mail:draft:agent', 'mail:send:agent'
+    ];
+    check(
+      'metadata advertises each mailbox\'s own capabilities',
+      JSON.stringify(meta.scopes_supported) === JSON.stringify(expected),
+      JSON.stringify(meta.scopes_supported)
+    );
+
+    const all = await c.startAuth(client.client_id, undefined);
+    check(
+      'consent page groups the scopes by mailbox',
+      ['gert@example.test', 'info@example.test', 'agent@example.test'].every((a) =>
+        all.html.includes(`<legend>${a}</legend>`)
+      )
+    );
+    check(
+      'send starts unticked; everything else starts ticked',
+      all.html.includes('value="mail:send:agent">') &&
+        expected.filter((s) => !s.startsWith('mail:send')).every((s) => all.html.includes(`value="${s}" checked`))
+    );
+    check('consent page says sending is drafts-only', all.html.includes('already in Drafts'));
+
+    const grant = async (ticked) => {
+      const a = await c.startAuth(client.client_id, undefined);
+      const l = await c.login(a.requestId, OPERATOR.password, ticked);
+      const cd = new URL(l.headers.get('location')).searchParams.get('code');
+      return c.token(client.client_id, cd, a.verifier);
+    };
+    const tok = await grant([
+      'mail:read:gert',
+      'mail:mark:gert',
+      'mail:draft:info', // no read on info: must be dropped
+      'mail:read:agent',
+      'mail:send:agent'
+    ]);
+    check(
+      'a write on a mailbox without read on it is dropped',
+      tok.scope === 'mail:read:gert mail:mark:gert mail:read:agent mail:send:agent',
+      tok.scope
+    );
+
+    const t = tok.access_token;
+    await rpc(srv, t, 'initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'auth-test', version: '0' }
+    });
+    const tools = (await rpc(srv, t, 'tools/list', {})).result?.tools ?? [];
+    const tool = (n) => tools.find((x) => x.name === n);
+    check('list_mailboxes and send_draft are registered', !!tool('list_mailboxes') && !!tool('send_draft'));
+    check(
+      'send_draft only accepts the mailboxes that may send',
+      JSON.stringify(tool('send_draft')?.inputSchema?.properties?.mailbox?.enum) === '["agent"]',
+      JSON.stringify(tool('send_draft')?.inputSchema?.properties?.mailbox)
+    );
+    check(
+      'with several mailboxes, the mailbox argument is required',
+      tool('search_messages')?.inputSchema?.required?.includes('mailbox') &&
+        tool('search_messages')?.inputSchema?.properties?.mailbox?.enum?.length === 3
+    );
+
+    const listed = json(await rpc(srv, t, 'tools/call', { name: 'list_mailboxes', arguments: {} }));
+    const byId = Object.fromEntries((listed ?? []).map((m) => [m.id, m]));
+    check(
+      'list_mailboxes reports what this token was granted',
+      JSON.stringify(byId.gert?.access) === '["read","mark"]' &&
+        JSON.stringify(byId.gert?.notGranted) === '["draft","move"]' &&
+        JSON.stringify(byId.info?.access) === '[]' &&
+        JSON.stringify(byId.agent?.access) === '["read","send"]' &&
+        byId.agent?.send?.recipients === 'reply-only',
+      JSON.stringify(listed)
+    );
+
+    const infoRead = await rpc(srv, t, 'tools/call', {
+      name: 'search_messages',
+      arguments: { mailbox: 'info', folder: 'INBOX' }
+    });
+    check('reading a mailbox without its read scope is refused', text(infoRead).includes('mail:read:info'), text(infoRead));
+
+    const noMailbox = await rpc(srv, t, 'tools/call', { name: 'search_messages', arguments: { folder: 'INBOX' } });
+    check(
+      'leaving out the mailbox is an error, not a silent default',
+      noMailbox.result?.isError === true || !!noMailbox.error,
+      JSON.stringify(noMailbox).slice(0, 160)
+    );
+
+    const sendTry = await rpc(srv, t, 'tools/call', { name: 'send_draft', arguments: { mailbox: 'agent', uid: 1 } });
+    check(
+      'send_draft with mail:send passes the scope check (then fails on the dead IMAP host)',
+      sendTry.result?.isError === true && !text(sendTry).includes('scope'),
+      text(sendTry)
+    );
+
+    const noSend = await grant(['mail:read:agent', 'mail:draft:agent']);
+    const sendDenied = await rpc(srv, noSend.access_token, 'tools/call', {
+      name: 'send_draft',
+      arguments: { mailbox: 'agent', uid: 1 }
+    });
+    check('send_draft is refused without mail:send:agent', text(sendDenied).includes('mail:send:agent'), text(sendDenied));
+
+    const gertMark = await rpc(srv, noSend.access_token, 'tools/call', {
+      name: 'mark_messages',
+      arguments: { mailbox: 'gert', uids: [1], seen: true }
+    });
+    check('a grant on one mailbox does not carry over to another', text(gertMark).includes('mail:read:gert'), text(gertMark));
+
+    const legacy = await c.startAuth(client.client_id, 'mail:read');
+    check(
+      'a legacy mail:read request is offered read on every mailbox',
+      ['gert', 'info', 'agent'].every((m) => legacy.html.includes(`value="mail:read:${m}"`)) &&
+        !legacy.html.includes('mail:draft')
+    );
+
+    const old = await mint(srv, 'mail:read mail:draft');
+    const oldList = json(await rpc(srv, old, 'tools/call', { name: 'list_mailboxes', arguments: {} }));
+    check(
+      'a legacy token applies to the first (default) mailbox only',
+      JSON.stringify(oldList?.map((m) => m.access)) === '[["read","draft"],[],[]]',
+      JSON.stringify(oldList?.map((m) => m.access))
+    );
+  } finally {
+    await srv.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function badConfig() {
+  console.log('\nMAILBOXES_CONFIG validation');
+  const dir = await mkdtemp(join(tmpdir(), 'imap-mcp-bad-'));
+  const run = async (yaml, env = {}) => {
+    const file = join(dir, `m${++rpcId}.yml`);
+    await writeFile(file, yaml);
+    return spawnSync(process.execPath, ['dist/index.js'], {
+      cwd: ROOT,
+      timeout: 15000,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        MCP_RESOURCE_URL: 'http://127.0.0.1:8797/mcp',
+        OAUTH_ISSUER_URL: 'http://127.0.0.1:8797',
+        PORT: '8797',
+        STATE_DIR: dir,
+        OPERATOR_USERNAME: OPERATOR.username,
+        OPERATOR_PASSWORD_HASH: 'scrypt$unused-but-long-enough',
+        JWT_SECRET: randomBytes(48).toString('base64'),
+        IMAP_HOST: '127.0.0.1',
+        MAILBOXES_CONFIG: file,
+        ...env
+      }
+    });
+  };
+  try {
+    const missingPw = await run('mailboxes:\n  a:\n    address: a@example.test\n    passwordEnv: PW_NOT_SET_ANYWHERE\n');
+    check(
+      'a mailbox whose password variable is unset stops startup',
+      missingPw.status !== 0 && missingPw.stderr.includes('PW_NOT_SET_ANYWHERE'),
+      missingPw.stderr.slice(-200)
+    );
+    const noSmtp = await run(
+      'mailboxes:\n  a:\n    address: a@example.test\n    passwordEnv: PW_A\n    capabilities: [read, send]\n',
+      { PW_A: 'x', SMTP_HOST: '' } // blank, as an env_file line "SMTP_HOST=" gives
+    );
+    check(
+      '"send" without an SMTP host stops startup',
+      noSmtp.status !== 0 && noSmtp.stderr.includes('SMTP_HOST'),
+      noSmtp.stderr.slice(-200)
+    );
+    const hiddenSent = await run(
+      'mailboxes:\n  a:\n    address: a@example.test\n    passwordEnv: PW_A\n    folders: [INBOX, Drafts]\n    capabilities: [read, draft, send]\n',
+      { PW_A: 'x', SMTP_HOST: '127.0.0.1' }
+    );
+    check(
+      '"send" with Sent outside the folder allowlist stops startup',
+      hiddenSent.status !== 0 && hiddenSent.stderr.includes('"Sent"'),
+      hiddenSent.stderr.slice(-200)
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 await draftsEnabled();
 await draftsDisabled();
 await writesDisabled();
+await multiMailbox();
+await badConfig();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failures.length > 0) {

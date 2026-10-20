@@ -1,24 +1,24 @@
 import { ImapFlow } from 'imapflow';
-import type { Config } from '../config.js';
+import type { MailboxConfig } from '../config.js';
 
 /**
- * One long-lived IMAP connection, reconnected on demand. imapflow serializes
- * mailbox access through getMailboxLock, so a single connection is both
- * sufficient and easier to reason about than a pool for a one-mailbox server.
+ * One long-lived IMAP connection per mailbox, reconnected on demand. imapflow
+ * serializes mailbox access through getMailboxLock, so a single connection is
+ * both sufficient and easier to reason about than a pool.
  */
 export class ImapConnection {
   private client: ImapFlow | undefined;
   private connecting: Promise<ImapFlow> | undefined;
 
-  constructor(private readonly cfg: Config) {}
+  constructor(private readonly cfg: MailboxConfig['imap']) {}
 
   private build(): ImapFlow {
     return new ImapFlow({
-      host: this.cfg.IMAP_HOST,
-      port: this.cfg.IMAP_PORT,
-      secure: this.cfg.IMAP_SECURE,
-      auth: { user: this.cfg.IMAP_USER, pass: this.cfg.IMAP_PASSWORD },
-      tls: { rejectUnauthorized: this.cfg.IMAP_TLS_REJECT_UNAUTHORIZED },
+      host: this.cfg.host,
+      port: this.cfg.port,
+      secure: this.cfg.secure,
+      auth: { user: this.cfg.user, pass: this.cfg.password },
+      tls: { rejectUnauthorized: this.cfg.tlsRejectUnauthorized },
       logger: false,
       // Keep the socket warm between the morning run and ad-hoc queries.
       maxIdleTime: 5 * 60 * 1000,

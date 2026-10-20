@@ -16,29 +16,12 @@ import type { Config } from '../config.js';
 import { FileStore } from './store.js';
 import { verifyPassword } from './password.js';
 import { renderLoginPage } from './login-page.js';
-
-export const SCOPES = ['mail:read', 'mail:draft', 'mail:mark', 'mail:move'] as const;
-export type Scope = (typeof SCOPES)[number];
-
-/**
- * The scopes this deployment actually offers. With ENABLE_DRAFTS=false there is
- * no create_draft tool, so mail:draft is neither advertised in the metadata
- * document nor grantable — asking for it is an invalid_scope error. The same
- * goes for mail:mark with ENABLE_MARKING=false and mail:move with ENABLE_MOVE=false.
- */
-export function supportedScopes(cfg: Config): Scope[] {
-  return SCOPES.filter(
-    (s) =>
-      (s !== 'mail:draft' || cfg.ENABLE_DRAFTS) &&
-      (s !== 'mail:mark' || cfg.ENABLE_MARKING) &&
-      (s !== 'mail:move' || cfg.ENABLE_MOVE)
-  );
-}
+import { expandRequested, normalizeGranted, parseScope, supportedScopes } from './scopes.js';
 
 /** Outcome of an operator sign-in attempt at POST /login. */
 export type LoginResult =
   | { ok: true; redirectTo: string }
-  | { ok: false; reason: 'expired' | 'credentials' | 'too_many_attempts'; error: string };
+  | { ok: false; reason: 'expired' | 'credentials' | 'too_many_attempts' | 'no_scope'; error: string };
 
 interface PendingAuthorization {
   clientId: string;
@@ -110,12 +93,12 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
     res: Response
   ): Promise<void> {
     const requestId = b64url(randomBytes(24));
-    const supported = supportedScopes(this.cfg);
-    // A client that names no scope is granted everything this deployment
-    // offers; a client that names some is held to exactly those.
-    const scopes = params.scopes?.length ? params.scopes : [...supported];
+    // A client that names no scope is offered everything this deployment
+    // has; a client that names some is held to exactly those.
+    const { scopes, unknown } = params.scopes?.length
+      ? expandRequested(this.cfg, params.scopes)
+      : { scopes: supportedScopes(this.cfg), unknown: [] };
 
-    const unknown = scopes.filter((s) => !supported.includes(s as Scope));
     if (unknown.length > 0) {
       const url = new URL(params.redirectUri);
       url.searchParams.set('error', 'invalid_scope');
@@ -145,7 +128,7 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
           requestId,
           clientName: client.client_name ?? client.client_id,
           scopes,
-          mailbox: this.cfg.IMAP_USER
+          mailboxes: this.cfg.mailboxes.map((m) => ({ id: m.id, address: m.address }))
         })
       );
   }
@@ -186,11 +169,25 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
       return { ok: false, reason: 'credentials', error: 'Incorrect username or password.' };
     }
 
+    // The operator may narrow what the client asked for, never widen it. A
+    // write on a mailbox is only kept alongside read on that same mailbox: being
+    // able to move or send in a mailbox you cannot look into makes no sense.
+    const ticked = req.scopes.filter((s) => selectedScopes.includes(s));
+    const readable = new Set(
+      ticked.map(parseScope).filter((p) => p?.capability === 'read').map((p) => p!.mailbox)
+    );
+    const scopes = ticked.filter((s) => readable.has(parseScope(s)?.mailbox ?? ''));
+    if (scopes.length === 0) {
+      // The password was right, so this is not a guess: the request stays
+      // pending and the operator can go back and tick a mailbox.
+      return {
+        ok: false,
+        reason: 'no_scope',
+        error: 'Grant read access to at least one mailbox. Go back and tick it to continue.'
+      };
+    }
+
     this.pending.delete(requestId);
-    // The operator may narrow what the client asked for, never widen it. A form
-    // that names nothing gets the floor (mail:read) — least privilege on a
-    // missing field, not everything.
-    const scopes = req.scopes.filter((s) => s === 'mail:read' || selectedScopes.includes(s));
     const code = b64url(randomBytes(32));
     this.codes.set(code, { ...req, scopes, used: false, expiresAt: Date.now() + CODE_TTL_MS });
 
@@ -325,7 +322,7 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
       throw new InvalidTokenError('Access token is invalid or expired');
     }
 
-    const scopes = String(payload.scope ?? '').split(' ').filter(Boolean);
+    const scopes = normalizeGranted(this.cfg, String(payload.scope ?? '').split(' ').filter(Boolean));
     return {
       token,
       clientId: String(payload.aud),

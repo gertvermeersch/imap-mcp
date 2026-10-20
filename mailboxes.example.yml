@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# Several mailboxes behind one connector. Copy to mailboxes.yml, mount it into
+# the container and point MAILBOXES_CONFIG at it. Never put a password in this
+# file: each mailbox names the environment variable that holds its app password.
+#
+# Connection settings (IMAP_HOST, IMAP_PORT, SMTP_HOST, ...) come from .env and
+# apply to every mailbox; override per mailbox with an `imap:` or `send.smtp:`
+# block if one lives elsewhere.
+#
+# The first mailbox is the default: tokens issued before this file existed
+# (scopes like "mail:read") keep working against it.
+# ---------------------------------------------------------------------------
+
+mailboxes:
+  # The id (gert, info, agent) is what tools and scopes use: mail:read:gert.
+  gert:
+    address: gert@yourdomain.example
+    passwordEnv: IMAP_PASSWORD_GERT
+    # Optional allowlist; omit for every folder (or the ALLOWED_FOLDERS default).
+    folders: [INBOX, Sent, Drafts, Archive]
+    # read is always included. No "send": Claude can only draft as you.
+    capabilities: [read, draft, mark, move]
+
+  info:
+    address: info@yourdomain.example
+    passwordEnv: IMAP_PASSWORD_INFO
+    capabilities: [read, draft, mark]
+
+  agent:
+    address: agent@yourdomain.example
+    name: Your Company Assistant # display name in the From header
+    passwordEnv: IMAP_PASSWORD_AGENT
+    capabilities: [read, draft, move, send]
+    # send_draft sends a message that is already in this mailbox's Drafts
+    # folder. The app password must allow SMTP as well as IMAP.
+    send:
+      # reply-only (default): only to people already in the conversation the
+      #   draft replies to.
+      # any: anyone.
+      # or a list of addresses and @domains: [client@example.com, "@yourdomain.example"]
+      recipients: reply-only
+      maxPerDay: 20       # rolling 24 hours
+      maxRecipients: 10   # To + Cc + Bcc of one message
+    # draftsFolder / sentFolder default to IMAP_DRAFTS_FOLDER / IMAP_SENT_FOLDER.

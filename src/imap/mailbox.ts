@@ -1,10 +1,11 @@
 import type { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
-import type { Config } from '../config.js';
+import type { Config, MailboxConfig } from '../config.js';
 import type { ImapConnection } from './client.js';
 
 export interface MessageSummary {
+  mailbox: string;
   uid: number;
   folder: string;
   messageId: string | undefined;
@@ -61,15 +62,20 @@ function addressText(a: unknown): string | undefined {
 export class Mailbox {
   constructor(
     private readonly cfg: Config,
+    readonly box: MailboxConfig,
     private readonly conn: ImapConnection
   ) {}
 
-  /** Throws unless the folder is inside the configured allowlist. */
+  get id(): string {
+    return this.box.id;
+  }
+
+  /** Throws unless the folder is inside this mailbox's allowlist. */
   private assertAllowed(folder: string): string {
-    const allowed = this.cfg.ALLOWED_FOLDERS;
+    const allowed = this.box.allowedFolders;
     if (allowed.length > 0 && !allowed.includes(folder)) {
       throw new MailboxError(
-        `Folder "${folder}" is not in this server's allowlist (${allowed.join(', ')})`
+        `Folder "${folder}" is not in the allowlist for mailbox "${this.box.id}" (${allowed.join(', ')})`
       );
     }
     return folder;
@@ -77,7 +83,7 @@ export class Mailbox {
 
   async listFolders(): Promise<Array<{ path: string; name: string; specialUse?: string }>> {
     const list = await this.conn.withClient((c) => c.list());
-    const allowed = this.cfg.ALLOWED_FOLDERS;
+    const allowed = this.box.allowedFolders;
     return list
       .filter((m) => !m.flags?.has('\\Noselect'))
       .filter((m) => allowed.length === 0 || allowed.includes(m.path))
@@ -221,8 +227,9 @@ export class Mailbox {
   }
 
   /**
-   * Appends a message to the Drafts folder with the \Draft flag. There is no
-   * SMTP client anywhere in this process, so this cannot send.
+   * Appends a message to the Drafts folder with the \Draft flag. Nothing here
+   * sends; a draft only leaves the mailbox through send_draft, for mailboxes
+   * granted that separately.
    */
   async createDraft(params: {
     to: string[];
@@ -232,7 +239,7 @@ export class Mailbox {
     inReplyToUid?: number;
     inReplyToFolder?: string;
   }): Promise<{ folder: string; uid: number | undefined; subject: string }> {
-    const drafts = this.assertAllowed(this.cfg.IMAP_DRAFTS_FOLDER);
+    const drafts = this.assertAllowed(this.box.draftsFolder);
 
     let inReplyTo: string | undefined;
     let references: string | undefined;
@@ -246,7 +253,7 @@ export class Mailbox {
     }
 
     const composer = new MailComposer({
-      from: this.cfg.IMAP_USER,
+      from: this.fromHeader(),
       to: params.to,
       ...(params.cc?.length ? { cc: params.cc } : {}),
       subject: params.subject,
@@ -262,23 +269,96 @@ export class Mailbox {
       });
     });
 
-    const res = await this.conn.withClient(async (client) => {
-      try {
-        return await client.append(drafts, raw, ['\\Draft'], new Date());
-      } catch (err) {
-        // RFC 3501: a TRYCREATE response code means "that mailbox does not
-        // exist, create it and retry". Mailcow ships a Drafts folder, but a
-        // renamed or localised one would otherwise fail here for good.
-        if (!this.isTryCreate(err)) throw err;
-        await client.mailboxCreate(drafts);
-        return client.append(drafts, raw, ['\\Draft'], new Date());
-      }
-    });
-    if (res === false) {
-      throw new MailboxError(`The server rejected the APPEND to "${drafts}"`);
-    }
+    const uid = await this.appendCreating(drafts, raw, ['\\Draft']);
+    return { folder: drafts, uid, subject: params.subject };
+  }
 
-    return { folder: drafts, uid: res?.uid, subject: params.subject };
+  // --- the IMAP half of send_draft ------------------------------------------
+
+  /**
+   * Reads a draft's full source out of the Drafts folder, read-only. Anything
+   * already flagged \Deleted has been sent (or thrown away) and is refused, so
+   * a retried call cannot send the same draft twice.
+   */
+  async loadDraft(uid: number): Promise<{ folder: string; source: Buffer }> {
+    const folder = this.assertAllowed(this.box.draftsFolder);
+    return this.conn.withFolder(folder, true, async (client) => {
+      const msg = await client.fetchOne(String(uid), { uid: true, flags: true, source: true }, { uid: true });
+      if (!msg || !msg.source) {
+        throw new MailboxError(`No draft with UID ${uid} in "${folder}" of mailbox "${this.box.id}"`);
+      }
+      if (msg.flags?.has('\\Deleted')) {
+        throw new MailboxError(`Draft ${uid} in "${folder}" is marked deleted: it was already sent or discarded`);
+      }
+      return { folder, source: msg.source };
+    });
+  }
+
+  /**
+   * Every address on the messages with the given Message-IDs, searched across
+   * the allowed folders. This is the evidence the reply-only policy checks
+   * recipients against, so it skips anything the agent could have written
+   * itself: the Drafts folder, any message still flagged \Draft (a draft moved
+   * elsewhere keeps the flag), and Junk/Trash, where a spammer's message must not
+   * count as a conversation.
+   */
+  async threadParticipants(messageIds: string[]): Promise<{ messages: number; addresses: Set<string> }> {
+    const addresses = new Set<string>();
+    let messages = 0;
+    if (messageIds.length === 0) return { messages, addresses };
+
+    const folders = (await this.listFolders()).filter(
+      (f) =>
+        f.path !== this.box.draftsFolder &&
+        !['\\Drafts', '\\Junk', '\\Trash'].includes(f.specialUse ?? '')
+    );
+    const ids = messageIds.slice(0, 20);
+    const query =
+      ids.length === 1
+        ? { header: { 'message-id': ids[0]! } }
+        : { or: ids.map((id) => ({ header: { 'message-id': id } })) };
+
+    for (const f of folders) {
+      await this.conn.withFolder(f.path, true, async (client) => {
+        const uids = (await client.search(query, { uid: true })) || [];
+        if (uids.length === 0) return;
+        for await (const msg of client.fetch(uids, { uid: true, flags: true, envelope: true }, { uid: true })) {
+          if (msg.flags?.has('\\Draft')) continue;
+          messages++;
+          const env = msg.envelope;
+          for (const list of [env?.from, env?.sender, env?.replyTo, env?.to, env?.cc]) {
+            for (const a of list ?? []) {
+              if (a.address) addresses.add(a.address.toLowerCase());
+            }
+          }
+        }
+      });
+    }
+    return { messages, addresses };
+  }
+
+  /** Files a sent message in the Sent folder, already marked read. */
+  async fileSent(raw: Buffer): Promise<{ folder: string; uid: number | undefined }> {
+    const folder = this.assertAllowed(this.box.sentFolder);
+    return { folder, uid: await this.appendCreating(folder, raw, ['\\Seen']) };
+  }
+
+  /**
+   * Takes a just-sent draft out of Drafts: the one place this server removes
+   * a message, and only after its copy is in Sent. UID EXPUNGE touches nothing
+   * but that UID; without UIDPLUS a plain EXPUNGE would also purge anything a
+   * human had flagged \Deleted, so then the draft is only flagged, which is
+   * still enough for loadDraft to refuse it.
+   */
+  async retireDraft(uid: number): Promise<'removed' | 'flagged'> {
+    const folder = this.assertAllowed(this.box.draftsFolder);
+    return this.conn.withFolder(folder, false, async (client) => {
+      if (client.capabilities.has('UIDPLUS')) {
+        if (await client.messageDelete(String(uid), { uid: true })) return 'removed';
+      }
+      await client.messageFlagsAdd(String(uid), ['\\Deleted'], { uid: true });
+      return 'flagged';
+    });
   }
 
   /**
@@ -376,6 +456,31 @@ export class Mailbox {
 
   // --- helpers -------------------------------------------------------------
 
+  /** The From header this mailbox writes: its address, with the display name if one is set. */
+  fromHeader(): string | { name: string; address: string } {
+    return this.box.name ? { name: this.box.name, address: this.box.address } : this.box.address;
+  }
+
+  /** APPENDs a message, creating the folder first if the server says it is missing. */
+  private async appendCreating(folder: string, raw: Buffer, flags: string[]): Promise<number | undefined> {
+    const res = await this.conn.withClient(async (client) => {
+      try {
+        return await client.append(folder, raw, flags, new Date());
+      } catch (err) {
+        // RFC 3501: a TRYCREATE response code means "that mailbox does not
+        // exist, create it and retry". Mailcow ships Drafts and Sent, but a
+        // renamed or localised one would otherwise fail here for good.
+        if (!this.isTryCreate(err)) throw err;
+        await client.mailboxCreate(folder);
+        return client.append(folder, raw, flags, new Date());
+      }
+    });
+    if (res === false) {
+      throw new MailboxError(`The server rejected the APPEND to "${folder}"`);
+    }
+    return res?.uid;
+  }
+
   /** De-duplicates and bounds a caller-supplied UID list. */
   private checkUidBatch(uids: number[]): number[] {
     const unique = [...new Set(uids)];
@@ -406,6 +511,7 @@ export class Mailbox {
   private toSummary(folder: string, msg: any): MessageSummary {
     const flags: Set<string> = msg.flags ?? new Set();
     return {
+      mailbox: this.box.id,
       uid: msg.uid,
       folder,
       messageId: msg.envelope?.messageId ?? undefined,

@@ -1,3 +1,6 @@
+import type { Capability } from '../config.js';
+import { parseScope } from './scopes.js';
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -7,29 +10,42 @@ function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
-const SCOPE_LABELS: Record<string, string> = {
-  'mail:read': 'Read messages, folders and search results',
-  'mail:draft': 'Save draft replies (never send)',
-  'mail:mark': 'Mark messages read/unread and flag or unflag them',
-  'mail:move': 'Move messages between folders'
+const CAPABILITY_LABELS: Record<Capability, string> = {
+  read: 'Read messages, folders and search results',
+  draft: 'Save drafts',
+  mark: 'Mark messages read/unread and flag or unflag them',
+  move: 'Move messages between folders',
+  send: 'Send messages that are in Drafts: real email, from this address'
 };
 
 export function renderLoginPage(opts: {
   requestId: string;
   clientName: string;
   scopes: string[];
-  mailbox: string;
+  mailboxes: Array<{ id: string; address: string }>;
   error?: string;
 }): string {
-  // mail:read is the floor: every /mcp request needs it, so it is shown but
-  // not optional. The rest are checked by default and can be unticked.
-  const items = opts.scopes
-    .map((s) => {
-      const required = s === 'mail:read';
-      return `<label class="scope"><input type="checkbox" name="scope" value="${escapeHtml(s)}" checked${required ? ' disabled' : ''}>
-        <span><code>${escapeHtml(s)}</code> — ${escapeHtml(SCOPE_LABELS[s] ?? s)}${required ? ' (always granted)' : ''}</span></label>`;
+  // One group per mailbox. Everything is ticked by default except send, which
+  // the operator has to choose deliberately. Writes are only granted together
+  // with read on the same mailbox; the provider enforces that, not this form.
+  const groups = opts.mailboxes
+    .map((m) => {
+      const items = opts.scopes
+        .filter((s) => parseScope(s)?.mailbox === m.id)
+        .map((s) => {
+          const cap = parseScope(s)!.capability;
+          const send = cap === 'send';
+          return `<label class="scope${send ? ' send' : ''}"><input type="checkbox" name="scope" value="${escapeHtml(s)}"${send ? '' : ' checked'}>
+        <span>${escapeHtml(CAPABILITY_LABELS[cap])} <code>${escapeHtml(s)}</code></span></label>`;
+        });
+      if (items.length === 0) return '';
+      return `<fieldset>
+        <legend>${escapeHtml(m.address)}</legend>
+        ${items.join('\n')}
+      </fieldset>`;
     })
     .join('\n');
+  const canSend = opts.scopes.some((s) => parseScope(s)?.capability === 'send');
 
   return `<!doctype html>
 <html lang="en">
@@ -56,6 +72,7 @@ export function renderLoginPage(opts: {
   label.scope { display:flex; gap:10px; align-items:flex-start; margin-bottom:8px; font-weight:400;
                 font-size:.9rem; color:var(--muted); }
   label.scope input { width:auto; margin:.3em 0 0; flex:none; }
+  label.scope.send span { color:var(--err); }
   code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.85em; }
   label { display:block; font-size:.85rem; margin-bottom:6px; font-weight:600; }
   input { width:100%; padding:10px 12px; margin-bottom:16px; border:1px solid var(--line);
@@ -73,22 +90,22 @@ export function renderLoginPage(opts: {
 <body>
   <main class="card">
     <h1>Authorize mailbox access</h1>
-    <p class="sub"><strong>${escapeHtml(opts.clientName)}</strong> is requesting access to your mailbox.</p>
+    <p class="sub"><strong>${escapeHtml(opts.clientName)}</strong> is requesting access to your ${opts.mailboxes.length > 1 ? 'mailboxes' : 'mailbox'}.</p>
     ${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ''}
     <form method="POST" action="/login" autocomplete="off">
       <input type="hidden" name="request_id" value="${escapeHtml(opts.requestId)}">
-      <fieldset>
-        <legend>Permissions to grant</legend>
-        ${items}
-      </fieldset>
+      ${groups}
       <label for="u">Username</label>
       <input id="u" name="username" autocapitalize="none" autocorrect="off" required>
       <label for="p">Password</label>
       <input id="p" name="password" type="password" required>
       <button type="submit">Authorize</button>
     </form>
-    <p class="mailbox">Mailbox: <code>${escapeHtml(opts.mailbox)}</code><br>
-    It can never send or permanently delete.</p>
+    <p class="mailbox">${
+      canSend
+        ? 'It can only send a message that is already in Drafts, from a mailbox ticked for sending. Apart from removing a draft once it is sent, it never deletes.'
+        : 'It can never send or permanently delete.'
+    }</p>
   </main>
 </body>
 </html>`;

@@ -5,7 +5,9 @@
  * dynamic client registration, PKCE authorization, operator login, code
  * exchange, audience-bound token — and then calls every tool over the
  * Streamable HTTP transport. Also asserts the negative cases that matter:
- * no token, wrong audience, wrong PKCE verifier, code replay.
+ * no token, wrong audience, wrong PKCE verifier, code replay. A second instance
+ * runs two mailboxes from a MAILBOXES_CONFIG file and sends real mail through
+ * GreenMail's SMTP with send_draft, including every refusal its policy makes.
  *
  * Usage: node test/smoke.mjs   (expects a built dist/)
  *
@@ -14,11 +16,12 @@
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
+import { ImapFlow } from 'imapflow';
 import { hashPassword } from '../dist/auth/password.js';
 
 const JAR = process.env.GREENMAIL_JAR;
@@ -33,6 +36,8 @@ const ORIGIN = `http://127.0.0.1:${APP_PORT}`;
 const RESOURCE = `${ORIGIN}/mcp`;
 const OPERATOR = { username: 'operator', password: 'correct-horse-battery' };
 const MAILBOX = { user: 'mailbox@example.test', pass: 'imap-secret' };
+const AGENT = { user: 'agent@example.test', pass: 'agent-secret' };
+const SCOPES = ['mail:read', 'mail:draft', 'mail:mark', 'mail:move'].map((s) => `${s}:mailbox`);
 
 let passed = 0;
 let failed = 0;
@@ -68,8 +73,8 @@ async function waitFor(fn, label, timeoutMs = 45000) {
 // --- MCP JSON-RPC helper ---------------------------------------------------
 
 let rpcId = 0;
-async function rpc(token, method, params) {
-  const res = await fetch(RESOURCE, {
+async function rpc(token, method, params, resource = RESOURCE) {
+  const res = await fetch(resource, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -113,7 +118,7 @@ try {
   console.log('\nStarting GreenMail...');
   const greenmailOpts = [
     '-Dgreenmail.setup.test.all',
-    `-Dgreenmail.users=${MAILBOX.user}:${MAILBOX.pass}`,
+    `-Dgreenmail.users=${MAILBOX.user}:${MAILBOX.pass},${AGENT.user}:${AGENT.pass}`,
     '-Dgreenmail.auth.disabled=false'
   ];
   if (JAR) {
@@ -274,7 +279,7 @@ try {
   authUrl.searchParams.set('code_challenge', challenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('state', 'xyz-state');
-  authUrl.searchParams.set('scope', 'mail:read mail:draft mail:mark mail:move');
+  authUrl.searchParams.set('scope', SCOPES.join(' '));
   authUrl.searchParams.set('resource', RESOURCE);
 
   const loginPage = await fetch(authUrl, { redirect: 'manual' });
@@ -300,7 +305,7 @@ try {
       ['request_id', requestId],
       ['username', OPERATOR.username],
       ['password', OPERATOR.password],
-      ...['mail:read', 'mail:draft', 'mail:mark', 'mail:move'].map((s) => ['scope', s])
+      ...SCOPES.map((s) => ['scope', s])
     ]),
     redirect: 'manual'
   });
@@ -389,13 +394,14 @@ try {
   const toolNames = (list.body?.result?.tools ?? []).map((t) => t.name).sort();
   check('tools/list works with a valid token', list.status === 200, `status ${list.status}`);
   check(
-    'exposes exactly the read + draft + mark + move surface',
+    'exposes exactly the read + draft + mark + move surface, and no send',
     JSON.stringify(toolNames) ===
       JSON.stringify([
         'create_draft',
         'get_message',
         'get_thread',
         'list_folders',
+        'list_mailboxes',
         'mark_messages',
         'move_messages',
         'search_messages'
@@ -567,6 +573,257 @@ try {
   check('restricted instance still demands a token', restrictedList.status === 401);
   restricted.kill('SIGTERM');
   check('ENABLE_DRAFTS=false is wired to the tool registration', true);
+
+  // === 8. Several mailboxes, and sending ===================================
+  console.log('\nTwo mailboxes and send_draft (separate instance)');
+  const threadId = '<agent-thread@example.test>';
+  await smtp.sendMail({
+    from: MAILBOX.user,
+    to: AGENT.user,
+    subject: 'Planning Q4',
+    text: 'Kan je de planning bevestigen?',
+    messageId: threadId
+  });
+  await sleep(1000);
+
+  const multiDir = await mkdtemp(join(tmpdir(), 'imap-mcp-multi-'));
+  await writeFile(
+    join(multiDir, 'mailboxes.yml'),
+    `mailboxes:
+  gert:
+    address: ${MAILBOX.user}
+    passwordEnv: SMOKE_PW_GERT
+    capabilities: [read, draft, mark, move]
+  agent:
+    address: ${AGENT.user}
+    name: Smoke Agent
+    passwordEnv: SMOKE_PW_AGENT
+    capabilities: [read, draft, move, send]
+    send:
+      recipients: reply-only
+      maxPerDay: 2
+`
+  );
+  const MULTI_ORIGIN = `http://127.0.0.1:${APP_PORT + 2}`;
+  const MULTI = `${MULTI_ORIGIN}/mcp`;
+  const multi = spawn('node', ['dist/index.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      MCP_RESOURCE_URL: MULTI,
+      OAUTH_ISSUER_URL: MULTI_ORIGIN,
+      PORT: String(APP_PORT + 2),
+      STATE_DIR: multiDir,
+      OPERATOR_USERNAME: OPERATOR.username,
+      OPERATOR_PASSWORD_HASH: await hashPassword(OPERATOR.password),
+      JWT_SECRET: randomBytes(48).toString('base64'),
+      MAILBOXES_CONFIG: join(multiDir, 'mailboxes.yml'),
+      SMOKE_PW_GERT: MAILBOX.pass,
+      SMOKE_PW_AGENT: AGENT.pass,
+      IMAP_HOST: '127.0.0.1',
+      IMAP_PORT: String(IMAP_PORT),
+      IMAP_SECURE: 'false',
+      IMAP_TLS_REJECT_UNAUTHORIZED: 'false',
+      SMTP_HOST: '127.0.0.1',
+      SMTP_PORT: String(SMTP_PORT),
+      SMTP_SECURE: 'false',
+      SMTP_TLS_REJECT_UNAUTHORIZED: 'false'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  const multiLog = [];
+  multi.stdout.on('data', (d) => multiLog.push(d.toString()));
+  multi.stderr.on('data', (d) => multiLog.push(d.toString()));
+  try {
+    await waitFor(async () => (await fetch(`${MULTI_ORIGIN}/healthz`)).ok, 'multi-mailbox instance');
+
+    // The whole OAuth dance again, granting send on the agent mailbox.
+    const reg = await (
+      await fetch(`${MULTI_ORIGIN}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_name: 'Smoke Multi',
+          redirect_uris: ['http://127.0.0.1:9999/callback'],
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+          token_endpoint_auth_method: 'none'
+        })
+      })
+    ).json();
+    const v = randomBytes(32).toString('base64url');
+    const au = new URL(`${MULTI_ORIGIN}/authorize`);
+    for (const [k, val] of Object.entries({
+      response_type: 'code',
+      client_id: reg.client_id,
+      redirect_uri: 'http://127.0.0.1:9999/callback',
+      code_challenge: createHash('sha256').update(v).digest('base64url'),
+      code_challenge_method: 'S256',
+      resource: MULTI
+    })) au.searchParams.set(k, val);
+    const page = await (await fetch(au)).text();
+    const granted = ['mail:read:gert', 'mail:read:agent', 'mail:draft:agent', 'mail:move:agent', 'mail:send:agent'];
+    const li = await fetch(`${MULTI_ORIGIN}/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams([
+        ['request_id', page.match(/name="request_id" value="([^"]+)"/)?.[1]],
+        ['username', OPERATOR.username],
+        ['password', OPERATOR.password],
+        ...granted.map((s) => ['scope', s])
+      ]),
+      redirect: 'manual'
+    });
+    const mcode = new URL(li.headers.get('location')).searchParams.get('code');
+    const mtok = await (
+      await fetch(`${MULTI_ORIGIN}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code: mcode,
+          code_verifier: v,
+          client_id: reg.client_id,
+          redirect_uri: 'http://127.0.0.1:9999/callback',
+          resource: MULTI
+        })
+      })
+    ).json();
+    check('a grant with send on the agent mailbox is issued', mtok.scope === granted.join(' '), mtok.scope);
+
+    const mcall = async (name, args) => (await rpc(mtok.access_token, 'tools/call', { name, arguments: args }, MULTI)).body;
+    const mres = async (name, args) => toolResult(await mcall(name, args));
+    const errText = (body) => (body?.result?.isError ? body.result.content?.[0]?.text ?? '' : '');
+
+    const boxes = await mres('list_mailboxes', {});
+    check(
+      'list_mailboxes shows both mailboxes and the agent\'s send policy',
+      boxes?.length === 2 && boxes[1].access.includes('send') && boxes[1].send?.recipients === 'reply-only',
+      JSON.stringify(boxes)
+    );
+
+    const agentInbox = await mres('search_messages', { mailbox: 'agent', folder: 'INBOX' });
+    const question = agentInbox?.find((m) => m.subject === 'Planning Q4');
+    check('each mailbox reads its own INBOX', !!question && question.mailbox === 'agent', JSON.stringify(agentInbox));
+    const gertInbox = await mres('search_messages', { mailbox: 'gert', folder: 'INBOX', subject: 'Planning Q4' });
+    check('...and not the other\'s', Array.isArray(gertInbox) && gertInbox.length === 0, JSON.stringify(gertInbox));
+
+    const draftFor = async (args) =>
+      (await mres('create_draft', { mailbox: 'agent', subject: 'Re: Planning Q4', body: 'Bevestigd.', ...args }))?.uid;
+
+    // --- refusals ----------------------------------------------------------
+    const strangerUid = await draftFor({ to: ['stranger@evil.test'], in_reply_to_uid: question.uid });
+    const stranger = await mcall('send_draft', { mailbox: 'agent', uid: strangerUid });
+    check(
+      'reply-only refuses a recipient who is not in the conversation',
+      errText(stranger).includes('stranger@evil.test'),
+      errText(stranger) || JSON.stringify(stranger)
+    );
+
+    const freshUid = await draftFor({ to: [MAILBOX.user] });
+    const fresh = await mcall('send_draft', { mailbox: 'agent', uid: freshUid });
+    check('reply-only refuses a draft that replies to nothing', errText(fresh).includes('does not reply'), errText(fresh));
+
+    // A draft moved out of Drafts keeps \Draft, so it cannot pose as the
+    // message being replied to and smuggle in a recipient.
+    const plantUid = await draftFor({ to: ['evil@x.test'], subject: 'planted' });
+    const planted = await mres('move_messages', { mailbox: 'agent', folder: 'Drafts', uids: [plantUid], destination: 'INBOX' });
+    const plantedUid = planted?.moved?.[0]?.newUid;
+    const smuggleUid = await draftFor({ to: ['evil@x.test'], in_reply_to_uid: plantedUid });
+    const smuggle = await mcall('send_draft', { mailbox: 'agent', uid: smuggleUid });
+    check(
+      'a draft moved into INBOX does not count as a conversation to reply to',
+      !!plantedUid && errText(smuggle).includes('was not found'),
+      errText(smuggle) || JSON.stringify(planted)
+    );
+
+    const notDraft = await mcall('send_draft', { mailbox: 'agent', uid: 99999 });
+    check('a UID that is not in Drafts is refused', errText(notDraft).includes('No draft'), errText(notDraft));
+
+    // --- a real send of a draft a human edited (added a Bcc) ---------------
+    const agentImap = new ImapFlow({
+      host: '127.0.0.1',
+      port: IMAP_PORT,
+      secure: false,
+      auth: { user: AGENT.user, pass: AGENT.pass },
+      logger: false
+    });
+    await agentImap.connect();
+    const oldDate = 'Mon, 01 Jan 2024 09:00:00 +0000';
+    const edited = [
+      `From: Smoke Agent <${AGENT.user}>`,
+      `To: ${MAILBOX.user}`,
+      `Bcc: ${AGENT.user}`,
+      'Subject: Re: Planning Q4',
+      `Date: ${oldDate}`,
+      'Message-ID: <smoke-reply@example.test>',
+      `In-Reply-To: ${threadId}`,
+      `References: ${threadId}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      'Bevestigd, planning volgt vrijdag.',
+      ''
+    ].join('\r\n');
+    const appended = await agentImap.append('Drafts', edited, ['\\Draft']);
+
+    const sent = await mres('send_draft', { mailbox: 'agent', uid: appended.uid });
+    check(
+      'send_draft sends a reply to someone in the conversation',
+      sent?.accepted?.includes(MAILBOX.user) && sent.messageId === '<smoke-reply@example.test>',
+      JSON.stringify(sent)
+    );
+    check('the sent copy is filed in Sent', sent?.sentFolder === 'Sent', JSON.stringify(sent));
+    check('the draft leaves Drafts', sent?.draft === 'removed' || sent?.draft === 'flagged', sent?.draft);
+    check('the send is in the server log', multiLog.join('').includes('[send] mailbox=agent'));
+
+    await sleep(1000);
+    const gertImap = new ImapFlow({
+      host: '127.0.0.1',
+      port: IMAP_PORT,
+      secure: false,
+      auth: { user: MAILBOX.user, pass: MAILBOX.pass },
+      logger: false
+    });
+    await gertImap.connect();
+    const sourceOf = async (client, folder, subject) => {
+      const lock = await client.getMailboxLock(folder);
+      try {
+        const uids = (await client.search({ subject }, { uid: true })) || [];
+        if (uids.length === 0) return undefined;
+        return (await client.fetchOne(String(uids.at(-1)), { source: true }, { uid: true }))?.source?.toString();
+      } finally {
+        lock.release();
+      }
+    };
+    const delivered = await sourceOf(gertImap, 'INBOX', 'Re: Planning Q4');
+    check('the recipient received it', !!delivered && delivered.includes('planning volgt vrijdag'));
+    check('the recipient\'s copy carries no Bcc header', !!delivered && !/^bcc:/im.test(delivered));
+    check('the Date is the moment of sending, not of drafting', !!delivered && !delivered.includes(oldDate));
+    const filed = await sourceOf(agentImap, 'Sent', 'Re: Planning Q4');
+    check('the copy in Sent keeps the Bcc', !!filed && /^bcc:/im.test(filed));
+    const bccCopy = await sourceOf(agentImap, 'INBOX', 'Re: Planning Q4');
+    check('the Bcc recipient received it too', !!bccCopy);
+    await gertImap.logout();
+    await agentImap.logout();
+
+    const again = await mcall('send_draft', { mailbox: 'agent', uid: appended.uid });
+    check('the same draft cannot be sent twice', !!errText(again), JSON.stringify(again).slice(0, 200));
+
+    // --- daily cap (2) -----------------------------------------------------
+    const secondUid = await draftFor({ to: [MAILBOX.user], in_reply_to_uid: question.uid });
+    const second = await mres('send_draft', { mailbox: 'agent', uid: secondUid });
+    check('a second reply goes out', second?.accepted?.length === 1, JSON.stringify(second));
+    const thirdUid = await draftFor({ to: [MAILBOX.user], in_reply_to_uid: question.uid });
+    const third = await mcall('send_draft', { mailbox: 'agent', uid: thirdUid });
+    check('the third in a day hits maxPerDay and sends nothing', errText(third).includes('limit is 2'), errText(third));
+
+    const gertSend = await mcall('send_draft', { mailbox: 'gert', uid: 1 });
+    check('a mailbox without "send" cannot be named in send_draft', !!errText(gertSend) || !!gertSend?.error);
+  } finally {
+    multi.kill('SIGTERM');
+    await rm(multiDir, { recursive: true, force: true });
+  }
 } catch (err) {
   failed++;
   failures.push(`harness error: ${err.message}`);

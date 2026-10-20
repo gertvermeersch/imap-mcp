@@ -4,21 +4,31 @@ import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelconte
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { loadConfig } from './config.js';
 import { FileStore } from './auth/store.js';
-import { ImapMcpOAuthProvider, supportedScopes } from './auth/provider.js';
+import { ImapMcpOAuthProvider } from './auth/provider.js';
+import { canReadAny, supportedScopes } from './auth/scopes.js';
 import { FailureThrottle } from './auth/rate-limit.js';
 import { renderErrorPage } from './auth/login-page.js';
 import { ImapConnection } from './imap/client.js';
 import { Mailbox } from './imap/mailbox.js';
 import { buildMcpServer } from './mcp/server.js';
+import { SendLog } from './smtp/send-log.js';
+import { DraftSender } from './smtp/sender.js';
 
 const cfg = loadConfig();
 
 const store = new FileStore(cfg.STATE_DIR);
 await store.init();
 
+const sendLog = new SendLog(cfg.STATE_DIR);
+await sendLog.init();
+
 const provider = new ImapMcpOAuthProvider(cfg, store);
-const imap = new ImapConnection(cfg);
-const mailbox = new Mailbox(cfg, imap);
+// One IMAP connection per mailbox, each with that mailbox's own login.
+const connections = cfg.mailboxes.map((m) => new ImapConnection(m.imap));
+const mailboxes = new Map(
+  cfg.mailboxes.map((m, i) => [m.id, new Mailbox(cfg, m, connections[i]!)] as const)
+);
+const sender = new DraftSender(sendLog);
 
 const app = express();
 app.disable('x-powered-by');
@@ -73,7 +83,7 @@ app.use(
     provider,
     issuerUrl: new URL(cfg.OAUTH_ISSUER_URL),
     resourceServerUrl: resourceUrl,
-    resourceName: `IMAP mailbox (${cfg.IMAP_USER})`,
+    resourceName: `IMAP mailbox (${cfg.mailboxes.map((m) => m.address).join(', ')})`,
     scopesSupported: supportedScopes(cfg)
   })
 );
@@ -132,9 +142,10 @@ app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async 
 
   const result = await provider.completeLogin(requestId, username, password, selectedScopes);
   if (!result.ok) {
-    // An expired or unknown request never reached a password check, so it is
-    // not a guess and must not count against the operator.
-    if (result.reason !== 'expired') {
+    // An expired request never reached a password check, and an empty scope
+    // selection got the password right, so neither is a guess and neither may
+    // count against the operator.
+    if (result.reason !== 'expired' && result.reason !== 'no_scope') {
       loginFailuresByIp.recordFailure(ip);
       loginFailuresGlobal.recordFailure(GLOBAL_KEY);
       console.warn(`[auth] failed login from ${ip} (${result.reason})`);
@@ -156,9 +167,9 @@ const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
 // back to scopes_supported from the metadata, which lists everything on offer.
 const bearer = requireBearerAuth({ verifier: provider, resourceMetadataUrl });
 
-/** Every token must carry mail:read; the challenge names all scopes on offer so a step-up can ask for drafts too. */
+/** Every token must be able to read some mailbox; the challenge names all scopes on offer so a step-up can ask for more. */
 const requireRead: express.RequestHandler = (req, res, next) => {
-  if ((req as express.Request & { auth?: { scopes: string[] } }).auth?.scopes.includes('mail:read')) {
+  if (canReadAny((req as express.Request & { auth?: { scopes: string[] } }).auth?.scopes ?? [])) {
     next();
     return;
   }
@@ -177,7 +188,7 @@ const requireRead: express.RequestHandler = (req, res, next) => {
  * or round-robin this container without breaking a connector mid-conversation.
  */
 app.post('/mcp', bearer, requireRead, express.json({ limit: '4mb' }), async (req, res) => {
-  const server = buildMcpServer(cfg, mailbox);
+  const server = buildMcpServer(cfg, mailboxes, sender);
   // enableJsonResponse makes a request/response exchange come back as plain
   // application/json instead of a one-event SSE stream. Both are legal
   // Streamable HTTP, but JSON is what the stricter clients cope with, and this
@@ -226,16 +237,20 @@ const server = app.listen(cfg.PORT, () => {
   console.log(`[imap-mcp] listening on :${cfg.PORT}`);
   console.log(`[imap-mcp] resource: ${cfg.MCP_RESOURCE_URL}`);
   console.log(`[imap-mcp] issuer:   ${cfg.OAUTH_ISSUER_URL}`);
-  console.log(`[imap-mcp] mailbox:  ${cfg.IMAP_USER}@${cfg.IMAP_HOST}:${cfg.IMAP_PORT}`);
-  console.log(`[imap-mcp] drafts:   ${cfg.ENABLE_DRAFTS ? cfg.IMAP_DRAFTS_FOLDER : 'disabled'}`);
-  console.log(`[imap-mcp] marking:  ${cfg.ENABLE_MARKING ? 'enabled' : 'disabled'}`);
-  console.log(`[imap-mcp] moving:   ${cfg.ENABLE_MOVE ? 'enabled' : 'disabled'}`);
+  for (const m of cfg.mailboxes) {
+    const send = m.send
+      ? ` (recipients: ${Array.isArray(m.send.recipients) ? m.send.recipients.join(',') : m.send.recipients}, ${m.send.maxPerDay}/day via ${m.send.smtp.host}:${m.send.smtp.port})`
+      : '';
+    console.log(
+      `[imap-mcp] mailbox ${m.id}: ${m.imap.user}@${m.imap.host}:${m.imap.port} — ${m.capabilities.join(', ')}${send}`
+    );
+  }
 });
 
 async function shutdown(signal: string): Promise<void> {
   console.log(`[imap-mcp] ${signal} received, shutting down`);
   server.close();
-  await imap.close();
+  await Promise.all(connections.map((c) => c.close()));
   process.exit(0);
 }
 
