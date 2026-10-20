@@ -1,6 +1,6 @@
 # imap-mcp
 
-A remote MCP server that gives Claude **read + draft** access to one IMAP mailbox, authenticated with OAuth 2.1.
+A remote MCP server that gives Claude **read, draft, mark and move** access to one IMAP mailbox, authenticated with OAuth 2.1. Each write capability is its own scope and can be switched off.
 
 Built to sit behind Traefik reverse proxy: TypeScript, Docker, Traefik. So IMAP itself is never exposed to the internet — only this server's HTTPS endpoint is.
 
@@ -16,14 +16,21 @@ claude.ai ──HTTPS/OAuth──▶ imap-mcp (VPS) ──IMAP/TLS, private subn
 | `search_messages` | Filters by date, sender, recipient, subject, body text, unread; returns summaries newest first |
 | `get_message` | Full headers, plain-text body (HTML converted), attachment metadata |
 | `get_thread` | The whole conversation, threaded on `Message-ID`/`References` |
-| `create_draft` | Composes and saves to Drafts, optionally threaded onto a reply |
+| `create_draft` | Composes and saves to Drafts, optionally threaded onto a reply (`mail:draft`) |
+| `mark_messages` | Marks messages read/unread and flags/unflags them; reports the resulting state (`mail:mark`) |
+| `move_messages` | Moves messages to another existing folder; reports old → new UIDs (`mail:move`) |
 
-There is **no SMTP client anywhere in this process**, so it cannot send. It also cannot delete, move, or change flags. Reading a message takes a read-only mailbox lock, so triage never marks anything `\Seen` — the mailbox looks untouched to a human afterwards.
+There is **no SMTP client anywhere in this process**, so it cannot send. It never issues `EXPUNGE` or a delete, so nothing is permanently removed (moving a message into a Trash folder is still a move — keep Trash out of `ALLOWED_FOLDERS` if that is a concern). Reading a message takes a read-only mailbox lock, so triage never marks anything `\Seen`; only `mark_messages` changes flags, and only `mark_messages` and `move_messages` take a read-write lock.
 
-Two switches tighten it further:
+Both batch tools take at most `MAX_SEARCH_RESULTS` UIDs per call. UIDs that don't exist are returned in `notFound` instead of failing the batch. `move_messages` needs both folders to be allowed, and the destination must already exist — it will not create one. UIDs change on a move; the new UID is reported when the server supports UIDPLUS.
 
-- `ALLOWED_FOLDERS` — an allowlist; anything not listed is invisible to every tool.
-- `ENABLE_DRAFTS=false` — drops `create_draft` entirely, making the server strictly read-only.
+Switches that tighten it further:
+
+- `ALLOWED_FOLDERS` — an allowlist; anything not listed is invisible to every tool, including as a move destination.
+- `ENABLE_DRAFTS=false` — drops `create_draft` and the `mail:draft` scope.
+- `ENABLE_MARKING=false` — drops `mark_messages` and the `mail:mark` scope.
+- `ENABLE_MOVE=false` — drops `move_messages` and the `mail:move` scope.
+- All three false makes the server strictly read-only.
 
 ## Security model
 
@@ -31,7 +38,7 @@ Two switches tighten it further:
 - **Audience binding (RFC 8707).** Access tokens are JWTs whose `aud` is this server's canonical URI. A token minted for any other resource is rejected — this is the check that stops a token from elsewhere being replayed here.
 - **One operator.** A single username plus an scrypt password hash. Registering an OAuth client is automatic; *authorizing* one always requires that human login.
 - **Refresh token rotation**, single-use authorization codes (60s), `iss` in the callback per RFC 9207.
-- **Scopes are enforced, not just advertised.** `mail:read` gates the endpoint; `create_draft` additionally checks `mail:draft` on every call. A client that asks for read-only gets a token that cannot draft. With `ENABLE_DRAFTS=false` the scope is not advertised or grantable at all.
+- **Scopes are enforced, not just advertised.** `mail:read` gates the endpoint; `create_draft`, `mark_messages` and `move_messages` additionally check `mail:draft`, `mail:mark` and `mail:move` on every call, and the scopes are independent — a token that can mark cannot move. A client that asks for read-only gets a token that can do none of them. The consent page also shows a checkbox per requested scope (all ticked by default; `mail:read` is locked on), so the operator can narrow a grant at sign-in — never widen it. Unticking everything grants read only, and the token response reports the narrower `scope`. With the matching `ENABLE_*` switch off, the scope is not advertised or grantable at all. Tokens issued before these scopes existed keep working for what they were granted; the connector has to be re-authorized to pick up `mail:mark` and `mail:move`.
 - **Sign-in throttling.** Five wrong passwords burn the authorization request, so further guesses cost a fresh `/authorize` round trip. Five failures from one address — or twenty across all addresses — lock the login form for 15 minutes with a `429` and a `Retry-After`. The counters are in memory and reset on restart.
 - The mailbox password lives only in the container env. It is never returned by a tool, never rendered in the login page, and never leaves the server.
 
@@ -101,7 +108,16 @@ npm run dev                       # tsx watch, reads .env from your shell
 
 ### Tests
 
-`test/smoke.mjs` runs the whole thing end to end against a throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/) IMAP server: OAuth discovery, dynamic client registration, PKCE, operator login, code exchange, refresh rotation, every tool, and the negative cases (no token, foreign audience, wrong verifier, replayed code, unknown folder).
+`test/smoke.mjs` runs the whole thing end to end against a throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/) IMAP server: OAuth discovery, dynamic client registration, PKCE, operator login, code exchange, refresh rotation, every tool (including marking and moving), and the negative cases (no token, foreign audience, wrong verifier, replayed code, unknown folder, moving to a missing folder).
+
+GreenMail runs in Docker by default, so the only requirement is a running Docker daemon:
+
+```bash
+npm run build
+npm run test:smoke
+```
+
+The test pulls `greenmail/standalone` on first use, starts a container named `imap-mcp-smoke-greenmail` on ports 3143/3025, and removes it afterwards. Without Docker, point it at a standalone jar and it runs under a local Java instead:
 
 ```bash
 curl -sfL -o /tmp/greenmail.jar \
@@ -110,15 +126,15 @@ npm run build
 GREENMAIL_JAR=/tmp/greenmail.jar node test/smoke.mjs
 ```
 
-39 checks; all should pass.
+50 checks; all should pass.
 
-`test/auth.mjs` covers scope enforcement and login throttling. It needs neither Java nor an IMAP server — every path it asserts is refused before the mailbox is reached — so it is the quick one to run after touching `src/auth/`:
+`test/auth.mjs` covers scope enforcement (including the mark and move scopes and the operator's scope picker) and login throttling. It needs neither Java nor an IMAP server — every path it asserts is refused before the mailbox is reached — so it is the quick one to run after touching `src/auth/`:
 
 ```bash
 npm run build && npm run test:auth
 ```
 
-22 checks; all should pass.
+38 checks; all should pass.
 
 `test/body-parts.mjs` unit-tests the structure walks behind `get_message` — which body part to render, which nodes are attachments, and how `References` is parsed — against BODYSTRUCTURE fixtures. No server at all:
 

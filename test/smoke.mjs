@@ -7,9 +7,12 @@
  * Streamable HTTP transport. Also asserts the negative cases that matter:
  * no token, wrong audience, wrong PKCE verifier, code replay.
  *
- * Usage: node test/smoke.mjs   (expects GREENMAIL_JAR and a built dist/)
+ * Usage: node test/smoke.mjs   (expects a built dist/)
+ *
+ * GreenMail runs in Docker (greenmail/standalone) unless GREENMAIL_JAR points at
+ * a standalone jar, in which case it runs under a local Java instead.
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -19,6 +22,8 @@ import nodemailer from 'nodemailer';
 import { hashPassword } from '../dist/auth/password.js';
 
 const JAR = process.env.GREENMAIL_JAR;
+const GREENMAIL_IMAGE = 'greenmail/standalone:2.1.13';
+const GREENMAIL_CONTAINER = 'imap-mcp-smoke-greenmail';
 /** Repo root, so the suite runs from wherever it is checked out. */
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const IMAP_PORT = 3143;
@@ -106,29 +111,48 @@ try {
   stateDir = await mkdtemp(join(tmpdir(), 'imap-mcp-test-'));
 
   console.log('\nStarting GreenMail...');
-  greenmail = spawn(
-    'java',
-    [
-      '-Dgreenmail.setup.test.all',
-      `-Dgreenmail.users=${MAILBOX.user}:${MAILBOX.pass}`,
-      '-Dgreenmail.auth.disabled=false',
-      '-jar',
-      JAR
-    ],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+  const greenmailOpts = [
+    '-Dgreenmail.setup.test.all',
+    `-Dgreenmail.users=${MAILBOX.user}:${MAILBOX.pass}`,
+    '-Dgreenmail.auth.disabled=false'
+  ];
+  if (JAR) {
+    greenmail = spawn('java', [...greenmailOpts, '-jar', JAR], { stdio: ['ignore', 'pipe', 'pipe'] });
+  } else {
+    // Inside a container GreenMail must listen on every interface, or the
+    // published ports have nothing behind them.
+    spawnSync('docker', ['rm', '-f', GREENMAIL_CONTAINER], { stdio: 'ignore' });
+    greenmail = spawn(
+      'docker',
+      [
+        'run', '--rm', '--name', GREENMAIL_CONTAINER,
+        '-e', `GREENMAIL_OPTS=${[...greenmailOpts, '-Dgreenmail.hostname=0.0.0.0'].join(' ')}`,
+        '-p', `127.0.0.1:${IMAP_PORT}:3143`,
+        '-p', `127.0.0.1:${SMTP_PORT}:3025`,
+        GREENMAIL_IMAGE
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+  }
   greenmail.stdout.on('data', () => {});
   greenmail.stderr.on('data', () => {});
 
   await waitFor(async () => {
     const { connect } = await import('node:net');
     return new Promise((resolve) => {
+      // A bare TCP connect is not enough: Docker's port proxy accepts before
+      // GreenMail is listening behind it. Wait for the IMAP greeting.
       const s = connect(IMAP_PORT, '127.0.0.1');
-      s.on('connect', () => {
+      s.setTimeout(2000, () => {
         s.destroy();
-        resolve(true);
+        resolve(false);
+      });
+      s.on('data', (d) => {
+        s.destroy();
+        resolve(d.toString().startsWith('* OK'));
       });
       s.on('error', () => resolve(false));
+      s.on('close', () => resolve(false));
     });
   }, 'GreenMail IMAP');
   console.log('GreenMail up.');
@@ -250,7 +274,7 @@ try {
   authUrl.searchParams.set('code_challenge', challenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('state', 'xyz-state');
-  authUrl.searchParams.set('scope', 'mail:read mail:draft');
+  authUrl.searchParams.set('scope', 'mail:read mail:draft mail:mark mail:move');
   authUrl.searchParams.set('resource', RESOURCE);
 
   const loginPage = await fetch(authUrl, { redirect: 'manual' });
@@ -272,11 +296,12 @@ try {
   const goodLogin = await fetch(`${ORIGIN}/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      request_id: requestId,
-      username: OPERATOR.username,
-      password: OPERATOR.password
-    }),
+    body: new URLSearchParams([
+      ['request_id', requestId],
+      ['username', OPERATOR.username],
+      ['password', OPERATOR.password],
+      ...['mail:read', 'mail:draft', 'mail:mark', 'mail:move'].map((s) => ['scope', s])
+    ]),
     redirect: 'manual'
   });
   check('correct password redirects back to the client', goodLogin.status === 302, `status ${goodLogin.status}`);
@@ -284,7 +309,9 @@ try {
   const code = cb.searchParams.get('code');
   check('redirect carries an authorization code', !!code);
   check('redirect preserves state', cb.searchParams.get('state') === 'xyz-state');
-  check('redirect includes iss (RFC 9207)', cb.searchParams.get('iss') === ORIGIN);
+  // The server normalizes the issuer to new URL(...).href, trailing slash included,
+  // so that it matches the metadata document byte for byte (see src/config.ts).
+  check('redirect includes iss (RFC 9207)', cb.searchParams.get('iss') === `${ORIGIN}/`, cb.searchParams.get('iss'));
 
   // === 5. Token exchange ===================================================
   async function exchange(body) {
@@ -362,9 +389,17 @@ try {
   const toolNames = (list.body?.result?.tools ?? []).map((t) => t.name).sort();
   check('tools/list works with a valid token', list.status === 200, `status ${list.status}`);
   check(
-    'exposes exactly the read + draft surface',
+    'exposes exactly the read + draft + mark + move surface',
     JSON.stringify(toolNames) ===
-      JSON.stringify(['create_draft', 'get_message', 'get_thread', 'list_folders', 'search_messages']),
+      JSON.stringify([
+        'create_draft',
+        'get_message',
+        'get_thread',
+        'list_folders',
+        'mark_messages',
+        'move_messages',
+        'search_messages'
+      ]),
     toolNames.join(', ')
   );
 
@@ -425,6 +460,71 @@ try {
   );
   check('the draft is really in the mailbox', Array.isArray(drafts) && drafts.length === 1, `got ${drafts?.length}`);
 
+  // --- marking -------------------------------------------------------------
+  const call = async (name, args) => (await rpc(token, 'tools/call', { name, arguments: args })).body;
+  const inboxUnseen = async () =>
+    toolResult(await call('search_messages', { folder: 'INBOX', unseen_only: true }));
+
+  const marked = toolResult(await call('mark_messages', { folder: 'INBOX', uids: [clientMail.uid], seen: true }));
+  check(
+    'mark_messages marks a message read',
+    marked?.updated?.length === 1 && marked.updated[0].unseen === false && marked.updated[0].flagged === false,
+    JSON.stringify(marked)
+  );
+  check('the read mark shows up in search', (await inboxUnseen())?.length === 2);
+
+  const flagged = toolResult(await call('mark_messages', { folder: 'INBOX', uids: [clientMail.uid], flagged: true }));
+  check(
+    'flagging leaves the read state alone',
+    flagged?.updated?.[0]?.flagged === true && flagged.updated[0].unseen === false,
+    JSON.stringify(flagged)
+  );
+
+  const unmarked = toolResult(
+    await call('mark_messages', { folder: 'INBOX', uids: [clientMail.uid], seen: false, flagged: false })
+  );
+  check(
+    'mark_messages can undo both',
+    unmarked?.updated?.[0]?.unseen === true && unmarked.updated[0].flagged === false,
+    JSON.stringify(unmarked)
+  );
+
+  const ghost = toolResult(await call('mark_messages', { folder: 'INBOX', uids: [clientMail.uid, 99999], seen: true }));
+  check(
+    'unknown UIDs are reported, not fatal',
+    ghost?.updated?.length === 1 && JSON.stringify(ghost.notFound) === '[99999]',
+    JSON.stringify(ghost)
+  );
+  await call('mark_messages', { folder: 'INBOX', uids: [clientMail.uid], seen: false });
+
+  const noop = await call('mark_messages', { folder: 'INBOX', uids: [clientMail.uid] });
+  check('mark_messages with nothing to change is an error', noop?.result?.isError === true);
+
+  // --- moving --------------------------------------------------------------
+  const newsletter = search.find((m) => m.subject === 'Your weekly digest of growth hacks');
+  const moved = toolResult(
+    await call('move_messages', { folder: 'INBOX', uids: [newsletter.uid], destination: 'Drafts' })
+  );
+  check(
+    'move_messages moves a message',
+    moved?.moved?.length === 1 && moved.moved[0].uid === newsletter.uid && moved.to === 'Drafts',
+    JSON.stringify(moved)
+  );
+  const inboxAfter = toolResult(await call('search_messages', { folder: 'INBOX' }));
+  const draftsAfter = toolResult(await call('search_messages', { folder: 'Drafts' }));
+  check(
+    'the message left the source and arrived at the destination',
+    inboxAfter?.length === 2 && draftsAfter?.some((m) => m.subject === newsletter.subject),
+    `inbox ${inboxAfter?.length}, drafts ${draftsAfter?.length}`
+  );
+
+  const toMissing = await call('move_messages', { folder: 'INBOX', uids: [clientMail.uid], destination: 'NoSuchFolder' });
+  check('moving to a missing folder fails, and does not create it', toMissing?.result?.isError === true);
+  const toSame = await call('move_messages', { folder: 'INBOX', uids: [clientMail.uid], destination: 'INBOX' });
+  check('moving into the same folder is an error', toSame?.result?.isError === true);
+  const stillThere = toolResult(await call('search_messages', { folder: 'INBOX' }));
+  check('failed moves leave the message where it was', stillThere?.some((m) => m.uid === clientMail.uid));
+
   const badFolderCall = await rpc(token, 'tools/call', {
     name: 'search_messages',
     arguments: { folder: 'NoSuchFolder' }
@@ -474,6 +574,7 @@ try {
 } finally {
   app?.kill('SIGTERM');
   greenmail?.kill('SIGTERM');
+  if (!JAR) spawnSync('docker', ['rm', '-f', GREENMAIL_CONTAINER], { stdio: 'ignore' });
   if (stateDir) await rm(stateDir, { recursive: true, force: true });
 }
 

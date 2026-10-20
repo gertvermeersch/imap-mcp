@@ -9,7 +9,9 @@ function escapeHtml(s: string): string {
 
 const SCOPE_LABELS: Record<string, string> = {
   'mail:read': 'Read messages, folders and search results',
-  'mail:draft': 'Save draft replies (never send)'
+  'mail:draft': 'Save draft replies (never send)',
+  'mail:mark': 'Mark messages read/unread and flag or unflag them',
+  'mail:move': 'Move messages between folders'
 };
 
 export function renderLoginPage(opts: {
@@ -19,8 +21,14 @@ export function renderLoginPage(opts: {
   mailbox: string;
   error?: string;
 }): string {
+  // mail:read is the floor: every /mcp request needs it, so it is shown but
+  // not optional. The rest are checked by default and can be unticked.
   const items = opts.scopes
-    .map((s) => `<li><code>${escapeHtml(s)}</code> — ${escapeHtml(SCOPE_LABELS[s] ?? s)}</li>`)
+    .map((s) => {
+      const required = s === 'mail:read';
+      return `<label class="scope"><input type="checkbox" name="scope" value="${escapeHtml(s)}" checked${required ? ' disabled' : ''}>
+        <span><code>${escapeHtml(s)}</code> — ${escapeHtml(SCOPE_LABELS[s] ?? s)}${required ? ' (always granted)' : ''}</span></label>`;
+    })
     .join('\n');
 
   return `<!doctype html>
@@ -43,8 +51,11 @@ export function renderLoginPage(opts: {
           border-radius:12px; padding:28px; }
   h1 { font-size:1.15rem; margin:0 0 4px; }
   p.sub { margin:0 0 20px; color:var(--muted); font-size:.9rem; }
-  ul { margin:0 0 20px; padding-left:1.1rem; font-size:.9rem; color:var(--muted); }
-  li { margin-bottom:4px; }
+  fieldset { border:0; margin:0 0 20px; padding:0; }
+  legend { font-size:.85rem; font-weight:600; padding:0; margin-bottom:8px; }
+  label.scope { display:flex; gap:10px; align-items:flex-start; margin-bottom:8px; font-weight:400;
+                font-size:.9rem; color:var(--muted); }
+  label.scope input { width:auto; margin:.3em 0 0; flex:none; }
   code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.85em; }
   label { display:block; font-size:.85rem; margin-bottom:6px; font-weight:600; }
   input { width:100%; padding:10px 12px; margin-bottom:16px; border:1px solid var(--line);
@@ -64,9 +75,12 @@ export function renderLoginPage(opts: {
     <h1>Authorize mailbox access</h1>
     <p class="sub"><strong>${escapeHtml(opts.clientName)}</strong> is requesting access to your mailbox.</p>
     ${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ''}
-    <ul>${items}</ul>
     <form method="POST" action="/login" autocomplete="off">
       <input type="hidden" name="request_id" value="${escapeHtml(opts.requestId)}">
+      <fieldset>
+        <legend>Permissions to grant</legend>
+        ${items}
+      </fieldset>
       <label for="u">Username</label>
       <input id="u" name="username" autocapitalize="none" autocorrect="off" required>
       <label for="p">Password</label>
@@ -74,7 +88,7 @@ export function renderLoginPage(opts: {
       <button type="submit">Authorize</button>
     </form>
     <p class="mailbox">Mailbox: <code>${escapeHtml(opts.mailbox)}</code><br>
-    ${opts.scopes.includes('mail:draft') ? 'This grant can read and draft.' : 'This grant is read-only.'} It can never send or delete.</p>
+    It can never send or permanently delete.</p>
   </main>
 </body>
 </html>`;

@@ -2,7 +2,7 @@
   "name": "imap-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Read + draft MCP server for a Mailcow IMAP mailbox, exposed to claude.ai over OAuth 2.1",
+  "description": "Read, draft, mark and move MCP server for a Mailcow IMAP mailbox, exposed to claude.ai over OAuth 2.1",
   "type": "module",
   "engines": {
     "node": ">=22"

@@ -281,7 +281,127 @@ export class Mailbox {
     return { folder: drafts, uid: res?.uid, subject: params.subject };
   }
 
+  /**
+   * Sets or clears \Seen and \Flagged on a batch of messages. Takes the folder
+   * lock read-write — the only place besides move that does — and reports the
+   * resulting state so the caller sees what the server actually holds.
+   */
+  async markMessages(params: {
+    folder: string;
+    uids: number[];
+    seen?: boolean;
+    flagged?: boolean;
+  }): Promise<{ folder: string; updated: Array<{ uid: number; unseen: boolean; flagged: boolean }>; notFound: number[] }> {
+    if (params.seen === undefined && params.flagged === undefined) {
+      throw new MailboxError('Nothing to change: pass seen and/or flagged.');
+    }
+    const folder = this.assertAllowed(params.folder);
+    const uids = this.checkUidBatch(params.uids);
+
+    return this.conn.withFolder(folder, false, async (client) => {
+      const { found, notFound } = await this.partitionExisting(client, uids);
+      if (found.length === 0) return { folder, updated: [], notFound };
+
+      const add: string[] = [];
+      const remove: string[] = [];
+      for (const [value, flag] of [
+        [params.seen, '\\Seen'],
+        [params.flagged, '\\Flagged']
+      ] as const) {
+        if (value === true) add.push(flag);
+        else if (value === false) remove.push(flag);
+      }
+      if (add.length > 0 && !(await client.messageFlagsAdd(found, add, { uid: true }))) {
+        throw new MailboxError(`The server rejected adding ${add.join(' ')} in "${folder}"`);
+      }
+      if (remove.length > 0 && !(await client.messageFlagsRemove(found, remove, { uid: true }))) {
+        throw new MailboxError(`The server rejected removing ${remove.join(' ')} in "${folder}"`);
+      }
+
+      const updated: Array<{ uid: number; unseen: boolean; flagged: boolean }> = [];
+      for await (const msg of client.fetch(found, { uid: true, flags: true }, { uid: true })) {
+        const flags: Set<string> = msg.flags ?? new Set();
+        updated.push({ uid: msg.uid, unseen: !flags.has('\\Seen'), flagged: flags.has('\\Flagged') });
+      }
+      updated.sort((a, b) => a.uid - b.uid);
+      return { folder, updated, notFound };
+    });
+  }
+
+  /**
+   * Moves messages to another folder. Both ends must be inside the allowlist,
+   * and the destination must already exist — unlike drafting, a typo here
+   * should fail rather than quietly mint a folder.
+   */
+  async moveMessages(params: {
+    folder: string;
+    uids: number[];
+    destination: string;
+  }): Promise<{
+    from: string;
+    to: string;
+    moved: Array<{ uid: number; newUid: number | undefined }>;
+    notFound: number[];
+  }> {
+    const from = this.assertAllowed(params.folder);
+    const to = this.assertAllowed(params.destination);
+    if (from === to) {
+      throw new MailboxError(`Messages are already in "${from}"`);
+    }
+    const uids = this.checkUidBatch(params.uids);
+
+    return this.conn.withFolder(from, false, async (client) => {
+      const { found, notFound } = await this.partitionExisting(client, uids);
+      if (found.length === 0) return { from, to, moved: [], notFound };
+
+      let res;
+      try {
+        res = await client.messageMove(found, to, { uid: true });
+      } catch (err) {
+        if (this.isTryCreate(err)) {
+          throw new MailboxError(`Destination folder "${to}" does not exist`);
+        }
+        throw err;
+      }
+      if (res === false) {
+        throw new MailboxError(`The server rejected the move from "${from}" to "${to}"`);
+      }
+
+      // uidMap needs UIDPLUS; without it the move still happened, we just
+      // cannot say what the new UIDs are.
+      const moved = found.map((uid) => ({ uid, newUid: res.uidMap?.get(uid) }));
+      return { from, to, moved, notFound };
+    });
+  }
+
   // --- helpers -------------------------------------------------------------
+
+  /** De-duplicates and bounds a caller-supplied UID list. */
+  private checkUidBatch(uids: number[]): number[] {
+    const unique = [...new Set(uids)];
+    if (unique.length === 0) throw new MailboxError('No UIDs given.');
+    if (unique.length > this.cfg.MAX_SEARCH_RESULTS) {
+      throw new MailboxError(
+        `Too many messages in one call (${unique.length}); the limit is ${this.cfg.MAX_SEARCH_RESULTS}.`
+      );
+    }
+    return unique;
+  }
+
+  /** Splits UIDs into those present in the open folder and those that are not. */
+  private async partitionExisting(
+    client: ImapFlow,
+    uids: number[]
+  ): Promise<{ found: number[]; notFound: number[] }> {
+    const present = new Set<number>();
+    for await (const msg of client.fetch(uids, { uid: true }, { uid: true })) {
+      present.add(msg.uid);
+    }
+    return {
+      found: uids.filter((u) => present.has(u)),
+      notFound: uids.filter((u) => !present.has(u))
+    };
+  }
 
   private toSummary(folder: string, msg: any): MessageSummary {
     const flags: Set<string> = msg.flags ?? new Set();

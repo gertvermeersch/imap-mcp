@@ -124,7 +124,13 @@ app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async 
     return;
   }
 
-  const result = await provider.completeLogin(requestId, username, password);
+  // One checkbox field per ticked scope: a string for one, an array for several.
+  const ticked: unknown = req.body?.scope;
+  const selectedScopes = (Array.isArray(ticked) ? ticked : [ticked]).filter(
+    (s): s is string => typeof s === 'string'
+  );
+
+  const result = await provider.completeLogin(requestId, username, password, selectedScopes);
   if (!result.ok) {
     // An expired or unknown request never reached a password check, so it is
     // not a guess and must not count against the operator.
@@ -222,6 +228,8 @@ const server = app.listen(cfg.PORT, () => {
   console.log(`[imap-mcp] issuer:   ${cfg.OAUTH_ISSUER_URL}`);
   console.log(`[imap-mcp] mailbox:  ${cfg.IMAP_USER}@${cfg.IMAP_HOST}:${cfg.IMAP_PORT}`);
   console.log(`[imap-mcp] drafts:   ${cfg.ENABLE_DRAFTS ? cfg.IMAP_DRAFTS_FOLDER : 'disabled'}`);
+  console.log(`[imap-mcp] marking:  ${cfg.ENABLE_MARKING ? 'enabled' : 'disabled'}`);
+  console.log(`[imap-mcp] moving:   ${cfg.ENABLE_MOVE ? 'enabled' : 'disabled'}`);
 });
 
 async function shutdown(signal: string): Promise<void> {

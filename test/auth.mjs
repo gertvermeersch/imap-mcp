@@ -131,15 +131,18 @@ function api(srv) {
       };
     },
 
-    login(requestId, password) {
+    /** `scopes` are the boxes left ticked on the consent page. */
+    login(requestId, password, scopes = []) {
+      const body = new URLSearchParams({
+        request_id: requestId,
+        username: OPERATOR.username,
+        password
+      });
+      for (const s of scopes) body.append('scope', s);
       return fetch(`${srv.origin}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          request_id: requestId,
-          username: OPERATOR.username,
-          password
-        }),
+        body,
         redirect: 'manual'
       });
     },
@@ -200,8 +203,9 @@ async function draftsEnabled() {
       await fetch(`${srv.origin}/.well-known/oauth-authorization-server`)
     ).json();
     check(
-      'metadata advertises both scopes',
-      JSON.stringify(meta.scopes_supported) === JSON.stringify(['mail:read', 'mail:draft']),
+      'metadata advertises every scope',
+      JSON.stringify(meta.scopes_supported) ===
+        JSON.stringify(['mail:read', 'mail:draft', 'mail:mark', 'mail:move']),
       JSON.stringify(meta.scopes_supported)
     );
 
@@ -253,6 +257,47 @@ async function draftsEnabled() {
       JSON.stringify(denied).slice(0, 220)
     );
 
+    for (const [name, scope, args] of [
+      ['mark_messages', 'mail:mark', { uids: [1], seen: true }],
+      ['move_messages', 'mail:move', { uids: [1], destination: 'Drafts' }]
+    ]) {
+      check(
+        `${name} is listed`,
+        !!tools.result?.tools?.some((t) => t.name === name)
+      );
+      const refused = await rpc(srv, tok.access_token, 'tools/call', { name, arguments: args });
+      const refusedText = refused.result?.content?.[0]?.text ?? '';
+      check(
+        `${name} is refused without ${scope}`,
+        refused.result?.isError === true && refusedText.includes(scope),
+        JSON.stringify(refused).slice(0, 220)
+      );
+    }
+
+    // A grant of one write scope must not unlock the others.
+    const markOnly = await c.startAuth(client.client_id, 'mail:read mail:mark');
+    const markLogin = await c.login(markOnly.requestId, OPERATOR.password, ['mail:mark']);
+    const markCode = new URL(markLogin.headers.get('location')).searchParams.get('code');
+    const markTok = await c.token(client.client_id, markCode, markOnly.verifier);
+    const markMoveDenied = await rpc(srv, markTok.access_token, 'tools/call', {
+      name: 'move_messages',
+      arguments: { uids: [1], destination: 'Drafts' }
+    });
+    check(
+      'mail:mark does not grant move_messages',
+      markMoveDenied.result?.isError === true &&
+        (markMoveDenied.result?.content?.[0]?.text ?? '').includes('mail:move')
+    );
+    const markAllowed = await rpc(srv, markTok.access_token, 'tools/call', {
+      name: 'mark_messages',
+      arguments: { uids: [1], seen: true }
+    });
+    check(
+      'mail:mark passes the scope check (then fails on the dead IMAP host)',
+      markAllowed.result?.isError === true &&
+        !(markAllowed.result?.content?.[0]?.text ?? '').includes('scope')
+    );
+
     // The refusal must be about scope, not a side effect of the dead IMAP host.
     const read = await rpc(srv, tok.access_token, 'tools/call', {
       name: 'search_messages',
@@ -268,7 +313,33 @@ async function draftsEnabled() {
     const scopeless = await c.startAuth(client.client_id, undefined);
     check(
       'a scopeless request is offered everything on offer',
-      scopeless.html.includes('mail:read') && scopeless.html.includes('mail:draft')
+      ['mail:read', 'mail:draft', 'mail:mark', 'mail:move'].every((s) => scopeless.html.includes(s))
+    );
+
+    console.log('\nDrafts enabled — operator picks the scopes');
+    const pick = async (requested, ticked) => {
+      const a = await c.startAuth(client.client_id, requested);
+      const l = await c.login(a.requestId, OPERATOR.password, ticked);
+      const cd = new URL(l.headers.get('location')).searchParams.get('code');
+      return (await c.token(client.client_id, cd, a.verifier)).scope;
+    };
+    const everything = await c.startAuth(client.client_id, 'mail:read mail:draft mail:mark mail:move');
+    check(
+      'consent page has a checkbox per requested scope',
+      (everything.html.match(/type="checkbox" name="scope"/g) ?? []).length === 4
+    );
+    check('mail:read cannot be unticked', /value="mail:read" checked disabled/.test(everything.html));
+    check(
+      'ticking a subset narrows the grant',
+      (await pick('mail:read mail:draft mail:mark mail:move', ['mail:mark'])) === 'mail:read mail:mark'
+    );
+    check(
+      'ticking nothing still grants mail:read, and nothing else',
+      (await pick('mail:read mail:draft mail:mark mail:move', [])) === 'mail:read'
+    );
+    check(
+      'a scope the client never asked for cannot be added by the form',
+      (await pick('mail:read', ['mail:move', 'mail:draft'])) === 'mail:read'
     );
 
     console.log('\nDrafts enabled — login throttling');
@@ -325,8 +396,8 @@ async function draftsDisabled() {
       await fetch(`${srv.origin}/.well-known/oauth-authorization-server`)
     ).json();
     check(
-      'metadata advertises mail:read only',
-      JSON.stringify(meta.scopes_supported) === JSON.stringify(['mail:read']),
+      'metadata no longer advertises mail:draft',
+      JSON.stringify(meta.scopes_supported) === JSON.stringify(['mail:read', 'mail:mark', 'mail:move']),
       JSON.stringify(meta.scopes_supported)
     );
 
@@ -340,8 +411,58 @@ async function draftsDisabled() {
 
     const scopeless = await c.startAuth(client.client_id, undefined);
     check(
-      'a scopeless request is offered mail:read only',
-      scopeless.html.includes('mail:read') && !scopeless.html.includes('mail:draft')
+      'a scopeless request is offered everything except mail:draft',
+      scopeless.html.includes('mail:read') &&
+        scopeless.html.includes('mail:mark') &&
+        scopeless.html.includes('mail:move') &&
+        !scopeless.html.includes('mail:draft')
+    );
+  } finally {
+    await srv.stop();
+  }
+}
+
+async function writesDisabled() {
+  console.log('\nMarking and moving disabled — their scopes are not on offer');
+  const srv = await startServer(8795, { ENABLE_MARKING: 'false', ENABLE_MOVE: 'false' });
+  const c = api(srv);
+  try {
+    const client = await c.register('auth-test-nomarkmove');
+
+    const meta = await (
+      await fetch(`${srv.origin}/.well-known/oauth-authorization-server`)
+    ).json();
+    check(
+      'metadata advertises read and draft only',
+      JSON.stringify(meta.scopes_supported) === JSON.stringify(['mail:read', 'mail:draft']),
+      JSON.stringify(meta.scopes_supported)
+    );
+
+    for (const scope of ['mail:mark', 'mail:move']) {
+      const asked = await c.startAuth(client.client_id, scope);
+      const location = asked.res.headers.get('location') ?? '';
+      check(
+        `requesting ${scope} is an invalid_scope error`,
+        asked.res.status === 302 && location.includes('error=invalid_scope'),
+        `${asked.res.status} ${location.slice(0, 160)}`
+      );
+    }
+
+    const auth = await c.startAuth(client.client_id, undefined);
+    const login = await c.login(auth.requestId, OPERATOR.password);
+    const code = new URL(login.headers.get('location')).searchParams.get('code');
+    const tok = await c.token(client.client_id, code, auth.verifier);
+    await rpc(srv, tok.access_token, 'initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'auth-test', version: '0' }
+    });
+    const tools = await rpc(srv, tok.access_token, 'tools/list', {});
+    const names = (tools.result?.tools ?? []).map((t) => t.name);
+    check(
+      'mark_messages and move_messages are not registered',
+      !names.includes('mark_messages') && !names.includes('move_messages'),
+      names.join(', ')
     );
   } finally {
     await srv.stop();
@@ -350,6 +471,7 @@ async function draftsDisabled() {
 
 await draftsEnabled();
 await draftsDisabled();
+await writesDisabled();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failures.length > 0) {

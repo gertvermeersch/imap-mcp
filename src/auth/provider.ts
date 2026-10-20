@@ -17,16 +17,22 @@ import { FileStore } from './store.js';
 import { verifyPassword } from './password.js';
 import { renderLoginPage } from './login-page.js';
 
-export const SCOPES = ['mail:read', 'mail:draft'] as const;
+export const SCOPES = ['mail:read', 'mail:draft', 'mail:mark', 'mail:move'] as const;
 export type Scope = (typeof SCOPES)[number];
 
 /**
  * The scopes this deployment actually offers. With ENABLE_DRAFTS=false there is
  * no create_draft tool, so mail:draft is neither advertised in the metadata
- * document nor grantable — asking for it is an invalid_scope error.
+ * document nor grantable — asking for it is an invalid_scope error. The same
+ * goes for mail:mark with ENABLE_MARKING=false and mail:move with ENABLE_MOVE=false.
  */
 export function supportedScopes(cfg: Config): Scope[] {
-  return cfg.ENABLE_DRAFTS ? [...SCOPES] : ['mail:read'];
+  return SCOPES.filter(
+    (s) =>
+      (s !== 'mail:draft' || cfg.ENABLE_DRAFTS) &&
+      (s !== 'mail:mark' || cfg.ENABLE_MARKING) &&
+      (s !== 'mail:move' || cfg.ENABLE_MOVE)
+  );
 }
 
 /** Outcome of an operator sign-in attempt at POST /login. */
@@ -151,7 +157,8 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
   async completeLogin(
     requestId: string,
     username: string,
-    password: string
+    password: string,
+    selectedScopes: string[] = []
   ): Promise<LoginResult> {
     const req = this.pending.get(requestId);
     if (!req || req.expiresAt <= Date.now()) {
@@ -180,8 +187,12 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
     }
 
     this.pending.delete(requestId);
+    // The operator may narrow what the client asked for, never widen it. A form
+    // that names nothing gets the floor (mail:read) — least privilege on a
+    // missing field, not everything.
+    const scopes = req.scopes.filter((s) => s === 'mail:read' || selectedScopes.includes(s));
     const code = b64url(randomBytes(32));
-    this.codes.set(code, { ...req, used: false, expiresAt: Date.now() + CODE_TTL_MS });
+    this.codes.set(code, { ...req, scopes, used: false, expiresAt: Date.now() + CODE_TTL_MS });
 
     const url = new URL(req.redirectUri);
     url.searchParams.set('code', code);

@@ -17,13 +17,38 @@ function fail(err: unknown) {
   return { content: [{ type: 'text' as const, text: message }], isError: true };
 }
 
+/**
+ * The bearer middleware only requires mail:read for the endpoint as a whole, so
+ * each write grant is checked here, where it is spent. Returns a tool error when
+ * the token lacks the scope, undefined when the call may proceed.
+ */
+function missingScope(
+  extra: { authInfo?: { scopes: string[] } },
+  scope: string,
+  action: string
+): ReturnType<typeof fail> | undefined {
+  if (extra.authInfo?.scopes.includes(scope)) return undefined;
+  return fail(
+    new MailboxError(
+      `This connection was not granted the ${scope} scope, so it cannot ${action}. Re-authorize the connector to grant it.`
+    )
+  );
+}
+
 export function buildMcpServer(cfg: Config, mailbox: Mailbox): McpServer {
+  const writes = [
+    cfg.ENABLE_DRAFTS && 'save drafts (create_draft)',
+    cfg.ENABLE_MARKING && 'mark messages read/unread or flagged (mark_messages)',
+    cfg.ENABLE_MOVE && 'move messages between folders (move_messages)'
+  ].filter(Boolean);
   const server = new McpServer(
     { name: 'imap-mcp', version: '0.1.0' },
     {
       instructions: [
-        `Read-only access to the IMAP mailbox ${cfg.IMAP_USER}, plus draft creation.`,
-        'This server cannot send, delete, move or flag mail. Reading a message does',
+        `Read access to the IMAP mailbox ${cfg.IMAP_USER}${
+          writes.length > 0 ? `, plus: ${writes.join('; ')}` : ' (strictly read-only)'
+        }.`,
+        'This server cannot send or delete mail. Reading a message does',
         'not mark it as seen. Use search_messages to find candidates, then',
         'get_message for full text, and get_thread when the conversation matters.'
       ].join(' ')
@@ -164,15 +189,8 @@ export function buildMcpServer(cfg: Config, mailbox: Mailbox): McpServer {
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
       },
       async (args, extra) => {
-        // The bearer middleware only requires mail:read for the endpoint as a
-        // whole, so the draft grant is checked here, where it is spent.
-        if (!extra.authInfo?.scopes.includes('mail:draft')) {
-          return fail(
-            new MailboxError(
-              'This connection was not granted the mail:draft scope, so it cannot save drafts. Re-authorize the connector to grant it.'
-            )
-          );
-        }
+        const denied = missingScope(extra, 'mail:draft', 'save drafts');
+        if (denied) return denied;
         try {
           return ok(
             await mailbox.createDraft({
@@ -182,6 +200,79 @@ export function buildMcpServer(cfg: Config, mailbox: Mailbox): McpServer {
               body: args.body,
               inReplyToUid: args.in_reply_to_uid,
               inReplyToFolder: args.in_reply_to_folder
+            })
+          );
+        } catch (err) {
+          return fail(err);
+        }
+      }
+    );
+  }
+
+  const uidList = (what: string) =>
+    z
+      .array(z.number().int().positive())
+      .min(1)
+      .max(cfg.MAX_SEARCH_RESULTS)
+      .describe(`IMAP UIDs from search_messages ${what} (max ${cfg.MAX_SEARCH_RESULTS} per call).`);
+
+  if (cfg.ENABLE_MARKING) {
+    server.registerTool(
+      'mark_messages',
+      {
+        title: 'Mark messages',
+        description:
+          'Mark messages in one folder as read or unread and/or flag or unflag them. Pass seen and/or flagged; anything omitted is left as it is. Reports the resulting state, and any UIDs that were not found.',
+        inputSchema: {
+          folder: z.string().default('INBOX').describe('Folder containing the messages.'),
+          uids: uidList('in that folder'),
+          seen: z.boolean().optional().describe('true marks as read, false marks as unread.'),
+          flagged: z.boolean().optional().describe('true sets the flag (star), false clears it.')
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async (args, extra) => {
+        const denied = missingScope(extra, 'mail:mark', 'change read or flag state');
+        if (denied) return denied;
+        try {
+          return ok(
+            await mailbox.markMessages({
+              folder: args.folder ?? 'INBOX',
+              uids: args.uids,
+              seen: args.seen,
+              flagged: args.flagged
+            })
+          );
+        } catch (err) {
+          return fail(err);
+        }
+      }
+    );
+  }
+
+  if (cfg.ENABLE_MOVE) {
+    server.registerTool(
+      'move_messages',
+      {
+        title: 'Move messages',
+        description:
+          'Move messages from one folder to another existing folder (e.g. file into Archive). UIDs change on a move: the result maps each old UID to its new one where the server reports it. Both folders must be readable by this server; nothing is deleted or copied.',
+        inputSchema: {
+          folder: z.string().default('INBOX').describe('Folder the messages are in now.'),
+          uids: uidList('in that folder'),
+          destination: z.string().min(1).describe('Folder path to move them to; it must already exist.')
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+      },
+      async (args, extra) => {
+        const denied = missingScope(extra, 'mail:move', 'move messages');
+        if (denied) return denied;
+        try {
+          return ok(
+            await mailbox.moveMessages({
+              folder: args.folder ?? 'INBOX',
+              uids: args.uids,
+              destination: args.destination
             })
           );
         } catch (err) {

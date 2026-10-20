@@ -82,6 +82,16 @@ const schema = z.object({
   ENABLE_DRAFTS: z
     .string()
     .default('true')
+    .transform((v) => v !== 'false'),
+  /** Set false to remove mark_messages (read/unread, flag) and the mail:mark scope. */
+  ENABLE_MARKING: z
+    .string()
+    .default('true')
+    .transform((v) => v !== 'false'),
+  /** Set false to remove move_messages and the mail:move scope. */
+  ENABLE_MOVE: z
+    .string()
+    .default('true')
     .transform((v) => v !== 'false')
 });
 
