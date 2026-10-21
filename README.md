@@ -127,26 +127,24 @@ tls:
         - http/1.1
 ```
 
-This is the same HTTP/2 multiplexing problem that bit the Dolibarr MCP. The compose labels already reference `http1only@file`.
+This avoids HTTP/2 multiplexing issues with long-lived MCP streams. The compose labels already reference `http1only@file`.
 
 **5. Bring it up.**
 
 ```bash
 docker compose up -d
-curl -s https://mail-mcp.example.be/healthz
-curl -s https://mail-mcp.example.be/.well-known/oauth-protected-resource/mcp | jq
+curl -s https://mail-mcp.example.com/healthz
+curl -s https://mail-mcp.example.com/.well-known/oauth-protected-resource/mcp | jq
 ```
 
 The second call should echo your `MCP_RESOURCE_URL` back as `resource`. If it doesn't, fix that before touching claude.ai.
 
 **6. Register the connector.** In claude.ai, Settings → Connectors → Add custom connector, URL `https://mail-mcp.example.be/mcp`. Claude registers itself, then sends you to the login page. Sign in with `OPERATOR_USERNAME` and the password you hashed. Tick what to grant per mailbox (send is off unless you tick it), approve, and the tools appear. To add a mailbox or grant send later, edit `mailboxes.yml`, restart, and re-authorize the connector.
 
-**7. Wire it into the morning triage.** Once the connector is live, the 07:00 scheduled task's prompt needs one edit: tell it to check this mailbox alongside Gmail. Ask Claude to update the task — the schedule and run history survive a prompt change.
-
 ## Network notes
 
 - The container needs a route to your Mailcow instance's IMAP. Attach it to whichever Docker network or host WireGuard interface provides that; the compose file assumes an external network named `mail`.
-- Anthropic reaches the endpoint from published IP ranges. If you want a second layer, add a Traefik `IPAllowList` middleware for those ranges — but know that if they change, the 07:00 task fails silently until you notice. OAuth alone is the lower-maintenance choice.
+- Anthropic reaches the endpoint from published IP ranges. If you want a second layer, add a Traefik `IPAllowList` middleware for those ranges — but changes to those ranges can block connector access. OAuth alone is the lower-maintenance choice.
 
 ## Development
 
