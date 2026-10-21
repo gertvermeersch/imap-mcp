@@ -3,9 +3,8 @@
  *
  * Unlike test/smoke.mjs this needs no IMAP server and no Java — every path it
  * exercises is refused before the mailbox is ever touched. It boots the real
- * dist/index.js in several configurations — one mailbox from env with various
- * switches off, and three mailboxes from a MAILBOXES_CONFIG file — and drives
- * the OAuth flow the way a client does.
+ * dist/index.js in several configurations — one mailbox with various switches
+ * off, and three mailboxes — and drives the OAuth flow the way a client does.
  *
  * Usage: node test/auth.mjs   (expects a built dist/)
  */
@@ -40,9 +39,19 @@ function check(name, condition, detail = '') {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const s256 = (v) => createHash('sha256').update(v).digest('base64url');
 
+/** The one mailbox a server gets unless a test hands it a MAILBOXES_CONFIG of its own. */
+const SINGLE_MAILBOX_YAML = `mailboxes:
+  mailbox:
+    address: mailbox@example.test
+    passwordEnv: PW_MAILBOX
+    capabilities: [read, draft, mark, move]
+`;
+
 /** Boots dist/index.js on `port` and resolves once /healthz answers. */
 async function startServer(port, extraEnv) {
   const stateDir = await mkdtemp(join(tmpdir(), 'imap-mcp-auth-'));
+  const defaultFile = join(stateDir, 'mailboxes.yml');
+  await writeFile(defaultFile, SINGLE_MAILBOX_YAML);
   const jwtSecret = randomBytes(48).toString('base64');
   const child = spawn(process.execPath, ['dist/index.js'], {
     cwd: ROOT,
@@ -59,8 +68,8 @@ async function startServer(port, extraEnv) {
       IMAP_HOST: '127.0.0.1',
       IMAP_PORT: '1',
       IMAP_SECURE: 'false',
-      IMAP_USER: 'mailbox@example.test',
-      IMAP_PASSWORD: 'unused',
+      MAILBOXES_CONFIG: defaultFile,
+      PW_MAILBOX: 'unused',
       ...extraEnv
     },
     stdio: ['ignore', 'ignore', 'pipe']
@@ -705,7 +714,7 @@ async function multiMailbox() {
 }
 
 async function badConfig() {
-  console.log('\nMAILBOXES_CONFIG validation');
+  console.log('\nMailbox file validation');
   const dir = await mkdtemp(join(tmpdir(), 'imap-mcp-bad-'));
   const run = async (yaml, env = {}) => {
     const file = join(dir, `m${++rpcId}.yml`);
@@ -730,6 +739,30 @@ async function badConfig() {
     });
   };
   try {
+    const absent = await run('', { MAILBOXES_CONFIG: join(dir, 'not-there.yml'), IMAP_USER: 'old@example.test' });
+    check(
+      'a missing mailboxes file stops startup and says where it looked',
+      absent.status !== 0 && absent.stderr.includes('not-there.yml') && absent.stderr.includes('mailboxes.example.yml'),
+      absent.stderr.slice(-300)
+    );
+    check(
+      'a leftover IMAP_USER is pointed at the file instead of silently ignored',
+      absent.stderr.includes('IMAP_USER and IMAP_PASSWORD are no longer read'),
+      absent.stderr.slice(-300)
+    );
+    const asDir = await run('', { MAILBOXES_CONFIG: dir });
+    check(
+      'a directory where the file should be is called out',
+      asDir.status !== 0 && asDir.stderr.includes('is a directory'),
+      asDir.stderr.slice(-300)
+    );
+    // A blank value (`MAILBOXES_CONFIG=` in an env file) falls back to the image's mount path.
+    const blank = await run('', { MAILBOXES_CONFIG: '' });
+    check(
+      'MAILBOXES_CONFIG defaults to /config/mailboxes.yml',
+      blank.status !== 0 && blank.stderr.includes('/config/mailboxes.yml'),
+      blank.stderr.slice(-300)
+    );
     const missingPw = await run('mailboxes:\n  a:\n    address: a@example.test\n    passwordEnv: PW_NOT_SET_ANYWHERE\n');
     check(
       'a mailbox whose password variable is unset stops startup',

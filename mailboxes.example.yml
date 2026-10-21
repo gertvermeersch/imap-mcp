@@ -1,16 +1,17 @@
 # ---------------------------------------------------------------------------
-# Several mailboxes behind one connector. Copy to mailboxes.yml, then in
-# docker-compose.yml uncomment the `environment` block and the
-# `./mailboxes.yml:/config/mailboxes.yml:ro` volume. Never put a password in
-# this file: each mailbox names the environment variable that holds its app
-# password.
+# The mailboxes behind this connector: one entry or several. Copy to
+# mailboxes.yml next to docker-compose.yml, which mounts it into the container;
+# there is nothing to point at it. Delete the entries you don't need. Never put
+# a password in this file: each mailbox names the environment variable that
+# holds its app password.
 #
 # Connection settings (IMAP_HOST, IMAP_PORT, SMTP_HOST, ...) come from .env and
 # apply to every mailbox; override per mailbox with an `imap:` or `send.smtp:`
 # block if one lives elsewhere.
 #
-# The first mailbox is the default: tokens issued before this file existed
-# (scopes like "mail:read") keep working against it.
+# The first mailbox is the default: tokens issued before scopes named a mailbox
+# ("mail:read") keep working against it. Moving from the old IMAP_USER setup?
+# Use the part before the @ as the id so existing tokens keep their grants.
 # ---------------------------------------------------------------------------
 
 mailboxes:

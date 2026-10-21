@@ -5,8 +5,8 @@
  * dynamic client registration, PKCE authorization, operator login, code
  * exchange, audience-bound token — and then calls every tool over the
  * Streamable HTTP transport. Also asserts the negative cases that matter:
- * no token, wrong audience, wrong PKCE verifier, code replay. A second instance
- * runs two mailboxes from a MAILBOXES_CONFIG file and sends real mail through
+ * no token, wrong audience, wrong PKCE verifier, code replay. A further instance
+ * runs two mailboxes from one mailboxes.yml and sends real mail through
  * GreenMail's SMTP with send_draft, including every refusal its policy makes.
  *
  * Usage: node test/smoke.mjs   (expects a built dist/)
@@ -38,6 +38,21 @@ const OPERATOR = { username: 'operator', password: 'correct-horse-battery' };
 const MAILBOX = { user: 'mailbox@example.test', pass: 'imap-secret' };
 const AGENT = { user: 'agent@example.test', pass: 'agent-secret' };
 const SCOPES = ['mail:read', 'mail:draft', 'mail:mark', 'mail:move'].map((s) => `${s}:mailbox`);
+
+/** A mailboxes.yml with MAILBOX as its only entry, for the instances that test one mailbox. */
+async function writeSingleMailboxFile(dir) {
+  const file = join(dir, 'mailboxes.yml');
+  await writeFile(
+    file,
+    `mailboxes:
+  mailbox:
+    address: ${MAILBOX.user}
+    passwordEnv: SMOKE_PW_MAILBOX
+    capabilities: [read, draft, mark, move]
+`
+  );
+  return file;
+}
 
 let passed = 0;
 let failed = 0;
@@ -210,8 +225,8 @@ try {
       IMAP_PORT: String(IMAP_PORT),
       IMAP_SECURE: 'false',
       IMAP_TLS_REJECT_UNAUTHORIZED: 'false',
-      IMAP_USER: MAILBOX.user,
-      IMAP_PASSWORD: MAILBOX.pass,
+      MAILBOXES_CONFIG: await writeSingleMailboxFile(stateDir),
+      SMOKE_PW_MAILBOX: MAILBOX.pass,
       IMAP_DRAFTS_FOLDER: 'Drafts',
       ALLOWED_FOLDERS: '',
       ENABLE_DRAFTS: 'true'
@@ -539,6 +554,7 @@ try {
 
   // === 7. Folder allowlist =================================================
   console.log('\nFolder allowlist (separate instance)');
+  const restrictedDir = await mkdtemp(join(tmpdir(), 'imap-mcp-test2-'));
   const restricted = spawn('node', ['dist/index.js'], {
     cwd: ROOT,
     env: {
@@ -546,7 +562,7 @@ try {
       MCP_RESOURCE_URL: `http://127.0.0.1:${APP_PORT + 1}/mcp`,
       OAUTH_ISSUER_URL: `http://127.0.0.1:${APP_PORT + 1}`,
       PORT: String(APP_PORT + 1),
-      STATE_DIR: await mkdtemp(join(tmpdir(), 'imap-mcp-test2-')),
+      STATE_DIR: restrictedDir,
       OPERATOR_USERNAME: OPERATOR.username,
       OPERATOR_PASSWORD_HASH: await hashPassword(OPERATOR.password),
       JWT_SECRET: randomBytes(48).toString('base64'),
@@ -554,8 +570,8 @@ try {
       IMAP_PORT: String(IMAP_PORT),
       IMAP_SECURE: 'false',
       IMAP_TLS_REJECT_UNAUTHORIZED: 'false',
-      IMAP_USER: MAILBOX.user,
-      IMAP_PASSWORD: MAILBOX.pass,
+      MAILBOXES_CONFIG: await writeSingleMailboxFile(restrictedDir),
+      SMOKE_PW_MAILBOX: MAILBOX.pass,
       ALLOWED_FOLDERS: 'INBOX',
       ENABLE_DRAFTS: 'false'
     },

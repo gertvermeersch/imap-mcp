@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
+const DEFAULT_MAILBOXES_CONFIG = '/config/mailboxes.yml';
+
 /** An optional setting, where a blank value (`SMTP_HOST=` in an env file) means unset. */
 const optional = () => z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).optional());
 
@@ -45,12 +47,12 @@ const schema = z.object({
 
   // --- Mailboxes -----------------------------------------------------------
   /**
-   * Path to a YAML file defining several mailboxes (see mailboxes.example.yml).
-   * Unset means the single mailbox described by IMAP_USER/IMAP_PASSWORD. The
-   * IMAP_* and SMTP_* connection settings below are the defaults every mailbox
-   * in the file inherits.
+   * YAML file defining the mailboxes, one or many (see mailboxes.example.yml).
+   * The Docker image expects it mounted at the default path, so only tests and
+   * bare-metal runs ever set this. The IMAP_* and SMTP_* connection settings
+   * below are the defaults every mailbox in the file inherits.
    */
-  MAILBOXES_CONFIG: optional(),
+  MAILBOXES_CONFIG: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).default(DEFAULT_MAILBOXES_CONFIG)),
 
   // --- IMAP (Mailcow, reached over the private subnet) ---------------------
   IMAP_HOST: z.string().min(1),
@@ -69,9 +71,6 @@ const schema = z.object({
     .string()
     .default('true')
     .transform((v) => v !== 'false'),
-  /** The single mailbox's login. Required unless MAILBOXES_CONFIG is set. */
-  IMAP_USER: optional(),
-  IMAP_PASSWORD: optional(),
   /** Folder that create_draft appends to. Mailcow's default is "Drafts". */
   IMAP_DRAFTS_FOLDER: z.string().default('Drafts'),
   /** Folder that send_draft files a copy of each sent message in. */
@@ -240,42 +239,31 @@ function enabledCapabilities(env: EnvConfig, wanted: Iterable<Capability>): Capa
   return CAPABILITIES.filter((c) => set.has(c) && on[c]);
 }
 
-/** The pre-multi-mailbox setup: one mailbox, entirely from IMAP_* env vars. Never sends. */
-function mailboxFromEnv(env: EnvConfig): MailboxConfig {
-  if (!env.IMAP_USER || !env.IMAP_PASSWORD) {
-    throw new Error(
-      'Invalid configuration:\n  IMAP_USER and IMAP_PASSWORD are required unless MAILBOXES_CONFIG is set'
-    );
+function readMailboxFile(path: string): unknown {
+  try {
+    return parseYaml(readFileSync(path, 'utf8'));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      // Deployments from before the file was mandatory configured one mailbox in .env.
+      const legacy = process.env.IMAP_USER
+        ? ' IMAP_USER and IMAP_PASSWORD are no longer read: describe that mailbox in the file instead.'
+        : '';
+      throw new Error(
+        `No mailbox configuration at ${path}. Mount mailboxes.yml there (see mailboxes.example.yml).${legacy}`
+      );
+    }
+    if (code === 'EISDIR') {
+      throw new Error(
+        `${path} is a directory: Docker creates one when the host file it mounts from does not exist. Create mailboxes.yml and recreate the container.`
+      );
+    }
+    throw new Error(`Cannot read mailbox configuration ${path}: ${(err as Error).message}`);
   }
-  // The local part names the mailbox in scopes, so personal@... keeps the id
-  // "personal" if this deployment later moves to a MAILBOXES_CONFIG file.
-  const local = env.IMAP_USER.split('@')[0] ?? env.IMAP_USER;
-  const id = local.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+/, '').slice(0, 32) || 'mailbox';
-  return {
-    id,
-    address: env.IMAP_USER,
-    imap: {
-      host: env.IMAP_HOST,
-      port: env.IMAP_PORT,
-      secure: env.IMAP_SECURE,
-      tlsRejectUnauthorized: env.IMAP_TLS_REJECT_UNAUTHORIZED,
-      user: env.IMAP_USER,
-      password: env.IMAP_PASSWORD
-    },
-    draftsFolder: env.IMAP_DRAFTS_FOLDER,
-    sentFolder: env.IMAP_SENT_FOLDER,
-    allowedFolders: env.ALLOWED_FOLDERS,
-    capabilities: enabledCapabilities(env, ['draft', 'mark', 'move'])
-  };
 }
 
 function mailboxesFromFile(env: EnvConfig, path: string): MailboxConfig[] {
-  let doc: unknown;
-  try {
-    doc = parseYaml(readFileSync(path, 'utf8'));
-  } catch (err) {
-    throw new Error(`Cannot read MAILBOXES_CONFIG ${path}: ${(err as Error).message}`);
-  }
+  const doc = readMailboxFile(path);
   const parsed = mailboxFile.safeParse(doc);
   if (!parsed.success) {
     const issues = parsed.error.issues
@@ -373,7 +361,7 @@ export function loadConfig(): Config {
     ...env,
     // The first mailbox is the default: tokens issued before scopes named a
     // mailbox ("mail:read") are read as applying to it.
-    mailboxes: env.MAILBOXES_CONFIG ? mailboxesFromFile(env, env.MAILBOXES_CONFIG) : [mailboxFromEnv(env)],
+    mailboxes: mailboxesFromFile(env, env.MAILBOXES_CONFIG),
     MCP_RESOURCE_URL: normalizeResourceUrl(parsed.data.MCP_RESOURCE_URL),
     // The metadata document publishes the issuer as new URL(issuer).href,
     // which always carries a trailing slash on a bare origin. RFC 9207 has

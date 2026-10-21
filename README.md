@@ -24,8 +24,7 @@ Every tool except `list_mailboxes` takes a `mailbox` id. With one mailbox config
 | `move_messages` | Moves messages to another existing folder; reports old → new UIDs (`mail:move`) |
 | `send_draft` | Sends a message that is already in that mailbox's Drafts folder, then files it in Sent (`mail:send`) |
 
-**Sending only ever happens through `send_draft`**, and only for mailboxes whose entry in `MAILBOXES_CONFIG` lists `send` (see [Sending](#sending)). There is no tool that composes and sends in one step. Claude writes the message with `create_draft`, and it sits in Drafts where a human can read, edit or delete it. `send_draft` then sends whatever is in Drafts at that moment. A single-mailbox deployment configured from env alone cannot send at all.
-
+**Sending only ever happens through `send_draft`**, and only for mailboxes whose entry in `mailboxes.yml` lists `send` (see [Sending](#sending)). There is no tool that composes and sends in one step. Claude writes the message with `create_draft`, and it sits in Drafts where a human can read, edit or delete it. `send_draft` then sends whatever is in Drafts at that moment.
 Nothing is permanently removed, with one exception. Once a draft has been sent, `send_draft` attempts to file it in Sent and remove it from Drafts (cleanup is attempted even if filing fails). It removes the draft with `UID EXPUNGE`, which touches only that UID. On a server without UIDPLUS it only flags the draft `\Deleted` and never expunges. No other tool issues `EXPUNGE` or a delete. Moving a message into a Trash folder is still a move, so keep Trash out of the folder allowlist if that is a concern. Reading a message takes a read-only mailbox lock, so triage never marks anything `\Seen`. `mark_messages` changes read/flag state; sending also sets flags when filing and retiring a draft. Only `mark_messages`, `move_messages` and `send_draft` take a read-write lock.
 
 Both batch tools take at most `MAX_SEARCH_RESULTS` UIDs per call. UIDs that don't exist are returned in `notFound` instead of failing the batch. `move_messages` needs both folders to be allowed, and the destination must already exist — it will not create one. UIDs change on a move; the new UID is reported when the server supports UIDPLUS.
@@ -33,7 +32,7 @@ Both batch tools take at most `MAX_SEARCH_RESULTS` UIDs per call. UIDs that don'
 Switches that tighten it further:
 
 - `ALLOWED_FOLDERS` (or `folders:` per mailbox): an allowlist. Anything not listed is invisible to every tool, including as a move destination.
-- `capabilities:` per mailbox in `MAILBOXES_CONFIG`: which of `read`, `draft`, `mark`, `move`, `send` that mailbox offers at all.
+- `capabilities:` per mailbox in `mailboxes.yml`: which of `read`, `draft`, `mark`, `move`, `send` that mailbox offers at all.
 - `ENABLE_DRAFTS=false`, `ENABLE_MARKING=false`, `ENABLE_MOVE=false`, `ENABLE_SEND=false`: global kill switches. Each one drops its tool and its scopes on every mailbox, whatever the config file says.
 - All four false makes the server strictly read-only. With the current config validator, disabling send also requires removing any per-mailbox `send:` sections; otherwise startup fails.
 
@@ -51,9 +50,9 @@ Switches that tighten it further:
 
 Give each mailbox a **dedicated Mailcow app password**, not its main one. Enable SMTP on that app password only for mailboxes that send.
 
-## Several mailboxes
+## Mailboxes
 
-Set `MAILBOXES_CONFIG` to a YAML file listing the mailboxes, mounted read-only into the container. [mailboxes.example.yml](mailboxes.example.yml) is the annotated template:
+A `mailboxes.yml` lists the mailboxes, one entry or several, and the compose file mounts it read-only at `/config/mailboxes.yml`, where the server looks for it. [mailboxes.example.yml](mailboxes.example.yml) is the annotated template:
 
 ```yaml
 mailboxes:
@@ -72,7 +71,9 @@ mailboxes:
       maxPerDay: 20
 ```
 
-Each mailbox is a separate IMAP login with its own connection, folder allowlist, Drafts and Sent folders. Host, port and TLS come from the `IMAP_*` and `SMTP_*` env vars and can be overridden per mailbox. Startup fails if the file is invalid, if a password variable is unset, or if a sending mailbox has no SMTP host or hides Drafts or Sent from its own allowlist. The first mailbox is the default that pre-upgrade tokens map to. Without `MAILBOXES_CONFIG`, the server runs the single mailbox from `IMAP_USER`/`IMAP_PASSWORD` as before, with the local part of the address as its id (`personal@...` becomes `personal`).
+Each mailbox is a separate IMAP login with its own connection, folder allowlist, Drafts and Sent folders. Host, port and TLS come from the `IMAP_*` and `SMTP_*` env vars and can be overridden per mailbox. Startup fails if the file is invalid, if a password variable is unset, or if a sending mailbox has no SMTP host or hides Drafts or Sent from its own allowlist. The first mailbox is the default that pre-upgrade tokens map to.
+
+**Coming from `IMAP_USER`/`IMAP_PASSWORD`?** Those are no longer read; the file is required even for one mailbox. Describe the mailbox in `mailboxes.yml`, use the part of the address before the `@` as its id so existing tokens keep their grants, and rename `IMAP_PASSWORD` to the variable the entry's `passwordEnv` names. The old setup gave that mailbox `read`, `draft`, `mark` and `move`; list them under `capabilities:` to keep the same behaviour.
 
 ## Sending
 
@@ -106,7 +107,7 @@ openssl rand -base64 48          # -> JWT_SECRET
 $EDITOR .env
 ```
 
-For several mailboxes, also `cp mailboxes.example.yml mailboxes.yml`, edit it, uncomment the `environment` block and the `mailboxes.yml` volume in the compose file (together they mount the file and point `MAILBOXES_CONFIG` at it), and set one `IMAP_PASSWORD_*` per mailbox in `.env`. Set `SMTP_HOST` if any mailbox sends.
+Also `cp mailboxes.example.yml mailboxes.yml` and edit it down to your mailboxes, before the first start (the compose file mounts it). Set one `IMAP_PASSWORD_*` per mailbox in `.env`, matching the `passwordEnv` names. Set `SMTP_HOST` if any mailbox sends.
 
 `MCP_RESOURCE_URL` must be **exactly** the URL you give claude.ai, including `/mcp`, with no trailing slash. It is the OAuth resource indicator and the JWT audience; a mismatch shows up as tokens being refused.
 
@@ -157,7 +158,7 @@ npm run dev                       # tsx watch; export configuration into your sh
 
 ### Tests
 
-`test/smoke.mjs` runs the whole thing end to end against a throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/) IMAP and SMTP server: OAuth discovery, dynamic client registration, PKCE, operator login, code exchange, refresh rotation, every tool (including marking and moving), and the negative cases (no token, foreign audience, wrong verifier, replayed code, unknown folder, moving to a missing folder). A second instance runs two mailboxes from a `MAILBOXES_CONFIG` file and really sends with `send_draft`. It checks delivery, the stripped Bcc, the Sent copy and the removed draft, and every refusal: a stranger under reply-only, a draft that replies to nothing, a planted draft posing as a conversation, a double send, and the daily cap.
+`test/smoke.mjs` runs the whole thing end to end against a throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/) IMAP and SMTP server: OAuth discovery, dynamic client registration, PKCE, operator login, code exchange, refresh rotation, every tool (including marking and moving), and the negative cases (no token, foreign audience, wrong verifier, replayed code, unknown folder, moving to a missing folder). A second instance runs two mailboxes from a `mailboxes.yml` and really sends with `send_draft`. It checks delivery, the stripped Bcc, the Sent copy and the removed draft, and every refusal: a stranger under reply-only, a draft that replies to nothing, a planted draft posing as a conversation, a double send, and the daily cap.
 
 GreenMail runs in Docker by default, so the only requirement is a running Docker daemon:
 
@@ -177,7 +178,7 @@ GREENMAIL_JAR=/tmp/greenmail.jar node test/smoke.mjs
 
 71 checks; all should pass.
 
-`test/auth.mjs` covers scope enforcement (including the mark and move scopes, per-mailbox scopes, legacy tokens and the operator's scope picker), `MAILBOXES_CONFIG` validation and login throttling. It needs neither Java nor an IMAP server — every path it asserts is refused before the mailbox is reached — so it is the quick one to run after touching `src/auth/`:
+`test/auth.mjs` covers scope enforcement (including the mark and move scopes, per-mailbox scopes, legacy tokens and the operator's scope picker), `mailboxes.yml` validation and login throttling. It needs neither Java nor an IMAP server — every path it asserts is refused before the mailbox is reached — so it is the quick one to run after touching `src/auth/`:
 
 ```bash
 npm run build && npm run test:auth
