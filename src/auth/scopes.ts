@@ -1,7 +1,7 @@
 import { CAPABILITIES, type Capability, type Config } from '../config.js';
 
 /**
- * Scopes name a capability and a mailbox: mail:read:gert, mail:send:agent. Each
+ * Scopes name a capability and a mailbox: mail:read:personal, mail:send:agent. Each
  * one is granted, checked and narrowed on its own, so a token can read three
  * mailboxes, draft in two and send from none.
  */

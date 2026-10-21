@@ -106,7 +106,7 @@ openssl rand -base64 48          # -> JWT_SECRET
 $EDITOR .env
 ```
 
-For several mailboxes, also `cp mailboxes.example.yml mailboxes.yml`, edit it, uncomment the `mailboxes.yml` volume in the compose file, and set `MAILBOXES_CONFIG=/config/mailboxes.yml` plus one `IMAP_PASSWORD_*` per mailbox in `.env`. Set `SMTP_HOST` if any mailbox sends.
+For several mailboxes, also `cp mailboxes.example.yml mailboxes.yml`, edit it, uncomment the `environment` block and the `mailboxes.yml` volume in the compose file (together they mount the file and point `MAILBOXES_CONFIG` at it), and set one `IMAP_PASSWORD_*` per mailbox in `.env`. Set `SMTP_HOST` if any mailbox sends.
 
 `MCP_RESOURCE_URL` must be **exactly** the URL you give claude.ai, including `/mcp`, with no trailing slash. It is the OAuth resource indicator and the JWT audience; a mismatch shows up as tokens being refused.
 

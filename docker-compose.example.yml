@@ -5,9 +5,15 @@ services:
     container_name: imap-mcp
     restart: unless-stopped
     env_file: .env
+    # Only with several mailboxes: cp mailboxes.example.yml mailboxes.yml, edit it
+    # and uncomment BOTH the environment block and the volume line below. Leave
+    # them commented out otherwise, or Docker creates mailboxes.yml as an empty
+    # directory. Keep MAILBOXES_CONFIG out of .env: it is the path inside the
+    # container, so it has to match the mount target.
+    # environment:
+    #   MAILBOXES_CONFIG: /config/mailboxes.yml
     volumes:
       - imap-mcp-state:/data
-      # Only with several mailboxes (MAILBOXES_CONFIG=/config/mailboxes.yml).
       # - ./mailboxes.yml:/config/mailboxes.yml:ro
     networks:
       - traefik

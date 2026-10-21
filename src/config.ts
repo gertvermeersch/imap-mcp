@@ -247,8 +247,8 @@ function mailboxFromEnv(env: EnvConfig): MailboxConfig {
       'Invalid configuration:\n  IMAP_USER and IMAP_PASSWORD are required unless MAILBOXES_CONFIG is set'
     );
   }
-  // The local part names the mailbox in scopes, so gert@... keeps the id
-  // "gert" if this deployment later moves to a MAILBOXES_CONFIG file.
+  // The local part names the mailbox in scopes, so personal@... keeps the id
+  // "personal" if this deployment later moves to a MAILBOXES_CONFIG file.
   const local = env.IMAP_USER.split('@')[0] ?? env.IMAP_USER;
   const id = local.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+/, '').slice(0, 32) || 'mailbox';
   return {

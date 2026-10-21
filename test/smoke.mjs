@@ -590,9 +590,9 @@ try {
   await writeFile(
     join(multiDir, 'mailboxes.yml'),
     `mailboxes:
-  gert:
+  personal:
     address: ${MAILBOX.user}
-    passwordEnv: SMOKE_PW_GERT
+    passwordEnv: SMOKE_PW_PERSONAL
     capabilities: [read, draft, mark, move]
   agent:
     address: ${AGENT.user}
@@ -618,7 +618,7 @@ try {
       OPERATOR_PASSWORD_HASH: await hashPassword(OPERATOR.password),
       JWT_SECRET: randomBytes(48).toString('base64'),
       MAILBOXES_CONFIG: join(multiDir, 'mailboxes.yml'),
-      SMOKE_PW_GERT: MAILBOX.pass,
+      SMOKE_PW_PERSONAL: MAILBOX.pass,
       SMOKE_PW_AGENT: AGENT.pass,
       IMAP_HOST: '127.0.0.1',
       IMAP_PORT: String(IMAP_PORT),
@@ -662,7 +662,7 @@ try {
       resource: MULTI
     })) au.searchParams.set(k, val);
     const page = await (await fetch(au)).text();
-    const granted = ['mail:read:gert', 'mail:read:agent', 'mail:draft:agent', 'mail:move:agent', 'mail:send:agent'];
+    const granted = ['mail:read:personal', 'mail:read:agent', 'mail:draft:agent', 'mail:move:agent', 'mail:send:agent'];
     const li = await fetch(`${MULTI_ORIGIN}/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -705,8 +705,8 @@ try {
     const agentInbox = await mres('search_messages', { mailbox: 'agent', folder: 'INBOX' });
     const question = agentInbox?.find((m) => m.subject === 'Planning Q4');
     check('each mailbox reads its own INBOX', !!question && question.mailbox === 'agent', JSON.stringify(agentInbox));
-    const gertInbox = await mres('search_messages', { mailbox: 'gert', folder: 'INBOX', subject: 'Planning Q4' });
-    check('...and not the other\'s', Array.isArray(gertInbox) && gertInbox.length === 0, JSON.stringify(gertInbox));
+    const personalInbox = await mres('search_messages', { mailbox: 'personal', folder: 'INBOX', subject: 'Planning Q4' });
+    check('...and not the other\'s', Array.isArray(personalInbox) && personalInbox.length === 0, JSON.stringify(personalInbox));
 
     const draftFor = async (args) =>
       (await mres('create_draft', { mailbox: 'agent', subject: 'Re: Planning Q4', body: 'Bevestigd.', ...args }))?.uid;
@@ -778,14 +778,14 @@ try {
     check('the send is in the server log', multiLog.join('').includes('[send] mailbox=agent'));
 
     await sleep(1000);
-    const gertImap = new ImapFlow({
+    const personalImap = new ImapFlow({
       host: '127.0.0.1',
       port: IMAP_PORT,
       secure: false,
       auth: { user: MAILBOX.user, pass: MAILBOX.pass },
       logger: false
     });
-    await gertImap.connect();
+    await personalImap.connect();
     const sourceOf = async (client, folder, subject) => {
       const lock = await client.getMailboxLock(folder);
       try {
@@ -796,7 +796,7 @@ try {
         lock.release();
       }
     };
-    const delivered = await sourceOf(gertImap, 'INBOX', 'Re: Planning Q4');
+    const delivered = await sourceOf(personalImap, 'INBOX', 'Re: Planning Q4');
     check('the recipient received it', !!delivered && delivered.includes('planning volgt vrijdag'));
     check('the recipient\'s copy carries no Bcc header', !!delivered && !/^bcc:/im.test(delivered));
     check('the Date is the moment of sending, not of drafting', !!delivered && !delivered.includes(oldDate));
@@ -804,7 +804,7 @@ try {
     check('the copy in Sent keeps the Bcc', !!filed && /^bcc:/im.test(filed));
     const bccCopy = await sourceOf(agentImap, 'INBOX', 'Re: Planning Q4');
     check('the Bcc recipient received it too', !!bccCopy);
-    await gertImap.logout();
+    await personalImap.logout();
     await agentImap.logout();
 
     const again = await mcall('send_draft', { mailbox: 'agent', uid: appended.uid });
@@ -818,8 +818,8 @@ try {
     const third = await mcall('send_draft', { mailbox: 'agent', uid: thirdUid });
     check('the third in a day hits maxPerDay and sends nothing', errText(third).includes('limit is 2'), errText(third));
 
-    const gertSend = await mcall('send_draft', { mailbox: 'gert', uid: 1 });
-    check('a mailbox without "send" cannot be named in send_draft', !!errText(gertSend) || !!gertSend?.error);
+    const personalSend = await mcall('send_draft', { mailbox: 'personal', uid: 1 });
+    check('a mailbox without "send" cannot be named in send_draft', !!errText(personalSend) || !!personalSend?.error);
   } finally {
     multi.kill('SIGTERM');
     await rm(multiDir, { recursive: true, force: true });

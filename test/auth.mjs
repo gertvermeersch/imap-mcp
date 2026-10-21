@@ -540,9 +540,9 @@ async function writesDisabled() {
 
 const MAILBOXES_YAML = `
 mailboxes:
-  gert:
-    address: gert@example.test
-    passwordEnv: PW_GERT
+  personal:
+    address: personal@example.test
+    passwordEnv: PW_PERSONAL
     capabilities: [read, draft, mark, move]
   info:
     address: info@example.test
@@ -565,7 +565,7 @@ async function multiMailbox() {
   await writeFile(file, MAILBOXES_YAML);
   const srv = await startServer(8796, {
     MAILBOXES_CONFIG: file,
-    PW_GERT: 'unused',
+    PW_PERSONAL: 'unused',
     PW_INFO: 'unused',
     PW_AGENT: 'unused',
     SMTP_HOST: '127.0.0.1',
@@ -576,7 +576,7 @@ async function multiMailbox() {
     const client = await c.register('auth-test-multi');
     const meta = await (await fetch(`${srv.origin}/.well-known/oauth-authorization-server`)).json();
     const expected = [
-      'mail:read:gert', 'mail:draft:gert', 'mail:mark:gert', 'mail:move:gert',
+      'mail:read:personal', 'mail:draft:personal', 'mail:mark:personal', 'mail:move:personal',
       'mail:read:info', 'mail:draft:info',
       'mail:read:agent', 'mail:draft:agent', 'mail:send:agent'
     ];
@@ -589,7 +589,7 @@ async function multiMailbox() {
     const all = await c.startAuth(client.client_id, undefined);
     check(
       'consent page groups the scopes by mailbox',
-      ['gert@example.test', 'info@example.test', 'agent@example.test'].every((a) =>
+      ['personal@example.test', 'info@example.test', 'agent@example.test'].every((a) =>
         all.html.includes(`<legend>${a}</legend>`)
       )
     );
@@ -607,15 +607,15 @@ async function multiMailbox() {
       return c.token(client.client_id, cd, a.verifier);
     };
     const tok = await grant([
-      'mail:read:gert',
-      'mail:mark:gert',
+      'mail:read:personal',
+      'mail:mark:personal',
       'mail:draft:info', // no read on info: must be dropped
       'mail:read:agent',
       'mail:send:agent'
     ]);
     check(
       'a write on a mailbox without read on it is dropped',
-      tok.scope === 'mail:read:gert mail:mark:gert mail:read:agent mail:send:agent',
+      tok.scope === 'mail:read:personal mail:mark:personal mail:read:agent mail:send:agent',
       tok.scope
     );
 
@@ -643,8 +643,8 @@ async function multiMailbox() {
     const byId = Object.fromEntries((listed ?? []).map((m) => [m.id, m]));
     check(
       'list_mailboxes reports what this token was granted',
-      JSON.stringify(byId.gert?.access) === '["read","mark"]' &&
-        JSON.stringify(byId.gert?.notGranted) === '["draft","move"]' &&
+      JSON.stringify(byId.personal?.access) === '["read","mark"]' &&
+        JSON.stringify(byId.personal?.notGranted) === '["draft","move"]' &&
         JSON.stringify(byId.info?.access) === '[]' &&
         JSON.stringify(byId.agent?.access) === '["read","send"]' &&
         byId.agent?.send?.recipients === 'reply-only',
@@ -678,16 +678,16 @@ async function multiMailbox() {
     });
     check('send_draft is refused without mail:send:agent', text(sendDenied).includes('mail:send:agent'), text(sendDenied));
 
-    const gertMark = await rpc(srv, noSend.access_token, 'tools/call', {
+    const personalMark = await rpc(srv, noSend.access_token, 'tools/call', {
       name: 'mark_messages',
-      arguments: { mailbox: 'gert', uids: [1], seen: true }
+      arguments: { mailbox: 'personal', uids: [1], seen: true }
     });
-    check('a grant on one mailbox does not carry over to another', text(gertMark).includes('mail:read:gert'), text(gertMark));
+    check('a grant on one mailbox does not carry over to another', text(personalMark).includes('mail:read:personal'), text(personalMark));
 
     const legacy = await c.startAuth(client.client_id, 'mail:read');
     check(
       'a legacy mail:read request is offered read on every mailbox',
-      ['gert', 'info', 'agent'].every((m) => legacy.html.includes(`value="mail:read:${m}"`)) &&
+      ['personal', 'info', 'agent'].every((m) => legacy.html.includes(`value="mail:read:${m}"`)) &&
         !legacy.html.includes('mail:draft')
     );
 

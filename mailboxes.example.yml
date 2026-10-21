@@ -1,7 +1,9 @@
 # ---------------------------------------------------------------------------
-# Several mailboxes behind one connector. Copy to mailboxes.yml, mount it into
-# the container and point MAILBOXES_CONFIG at it. Never put a password in this
-# file: each mailbox names the environment variable that holds its app password.
+# Several mailboxes behind one connector. Copy to mailboxes.yml, then in
+# docker-compose.yml uncomment the `environment` block and the
+# `./mailboxes.yml:/config/mailboxes.yml:ro` volume. Never put a password in
+# this file: each mailbox names the environment variable that holds its app
+# password.
 #
 # Connection settings (IMAP_HOST, IMAP_PORT, SMTP_HOST, ...) come from .env and
 # apply to every mailbox; override per mailbox with an `imap:` or `send.smtp:`
@@ -12,10 +14,10 @@
 # ---------------------------------------------------------------------------
 
 mailboxes:
-  # The id (gert, info, agent) is what tools and scopes use: mail:read:gert.
-  gert:
-    address: gert@yourdomain.example
-    passwordEnv: IMAP_PASSWORD_GERT
+  # The id (personal, info, agent) is what tools and scopes use: mail:read:personal.
+  personal:
+    address: personal@yourdomain.example
+    passwordEnv: IMAP_PASSWORD_PERSONAL
     # Optional allowlist; omit for every folder (or the ALLOWED_FOLDERS default).
     folders: [INBOX, Sent, Drafts, Archive]
     # read is always included. No "send": Claude can only draft as you.
