@@ -25,7 +25,7 @@ services:
       - traefik.http.services.imap-mcp.loadbalancer.server.port=8080
 
       # ---------------------------------------------------------------------
-      # The HTTP/2 trap that bit the Dolibarr MCP: some MCP clients hold a GET
+      # The HTTP/2 trap that bit another MCP project: some MCP clients hold a GET
       # stream open, and Traefik's h2c multiplexing mangles it. Pin this router
       # to HTTP/1.1 by advertising only http/1.1 in ALPN on its TLS options.
       # Define the named option once in your static/dynamic config:
