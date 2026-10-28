@@ -18,15 +18,40 @@ const CAPABILITY_LABELS: Record<Capability, string> = {
   send: 'Send messages that are in Drafts: real email, from this address'
 };
 
-export function renderLoginPage(opts: {
+/**
+ * Step 1 of an authorization: who is signing in. It names no mailbox and no
+ * scope, because until the password checks out the page cannot know whose
+ * mailboxes to show, and must not show anyone else's.
+ */
+export function renderLoginPage(opts: { requestId: string; clientName: string; error?: string }): string {
+  return page(`
+    <h1>Authorize mailbox access</h1>
+    <p class="sub"><strong>${escapeHtml(opts.clientName)}</strong> is requesting access to your mail. Sign in to choose what it may do.</p>
+    ${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ''}
+    <form method="POST" action="/login" autocomplete="off">
+      <input type="hidden" name="request_id" value="${escapeHtml(opts.requestId)}">
+      <label for="u">Username</label>
+      <input id="u" name="username" autocapitalize="none" autocorrect="off" required>
+      <label for="p">Password</label>
+      <input id="p" name="password" type="password" required>
+      <button type="submit">Sign in</button>
+    </form>`);
+}
+
+/**
+ * Step 2: what the signed-in user grants. Only their own mailboxes, and only
+ * what the client asked for in them.
+ */
+export function renderConsentPage(opts: {
   requestId: string;
   clientName: string;
+  user: string;
   scopes: string[];
   mailboxes: Array<{ id: string; address: string }>;
   error?: string;
 }): string {
   // One group per mailbox. Everything is ticked by default except send, which
-  // the operator has to choose deliberately. Writes are only granted together
+  // the user has to choose deliberately. Writes are only granted together
   // with read on the same mailbox; the provider enforces that, not this form.
   const groups = opts.mailboxes
     .map((m) => {
@@ -47,6 +72,23 @@ export function renderLoginPage(opts: {
     .join('\n');
   const canSend = opts.scopes.some((s) => parseScope(s)?.capability === 'send');
 
+  return page(`
+    <h1>Authorize mailbox access</h1>
+    <p class="sub"><strong>${escapeHtml(opts.clientName)}</strong> is requesting access to your ${opts.mailboxes.length > 1 ? 'mailboxes' : 'mailbox'}. Signed in as <strong>${escapeHtml(opts.user)}</strong>.</p>
+    ${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ''}
+    <form method="POST" action="/consent" autocomplete="off">
+      <input type="hidden" name="request_id" value="${escapeHtml(opts.requestId)}">
+      ${groups}
+      <button type="submit">Authorize</button>
+    </form>
+    <p class="mailbox">${
+      canSend
+        ? 'It can only send a message that is already in Drafts, from a mailbox ticked for sending. Apart from removing a draft once it is sent, it never deletes.'
+        : 'It can never send or permanently delete.'
+    }</p>`);
+}
+
+function page(body: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -88,24 +130,7 @@ export function renderLoginPage(opts: {
 </style>
 </head>
 <body>
-  <main class="card">
-    <h1>Authorize mailbox access</h1>
-    <p class="sub"><strong>${escapeHtml(opts.clientName)}</strong> is requesting access to your ${opts.mailboxes.length > 1 ? 'mailboxes' : 'mailbox'}.</p>
-    ${opts.error ? `<div class="err">${escapeHtml(opts.error)}</div>` : ''}
-    <form method="POST" action="/login" autocomplete="off">
-      <input type="hidden" name="request_id" value="${escapeHtml(opts.requestId)}">
-      ${groups}
-      <label for="u">Username</label>
-      <input id="u" name="username" autocapitalize="none" autocorrect="off" required>
-      <label for="p">Password</label>
-      <input id="p" name="password" type="password" required>
-      <button type="submit">Authorize</button>
-    </form>
-    <p class="mailbox">${
-      canSend
-        ? 'It can only send a message that is already in Drafts, from a mailbox ticked for sending. Apart from removing a draft once it is sent, it never deletes.'
-        : 'It can never send or permanently delete.'
-    }</p>
+  <main class="card">${body}
   </main>
 </body>
 </html>`;

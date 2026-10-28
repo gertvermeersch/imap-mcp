@@ -92,14 +92,18 @@ export class DraftSender {
 
   constructor(private readonly log: SendLog) {}
 
-  sendDraft(mailbox: Mailbox, uid: number): Promise<SendResult> {
+  /**
+   * `user` is who asked, for the log; the daily cap belongs to the mailbox, so
+   * users who share a sending mailbox share its cap.
+   */
+  sendDraft(mailbox: Mailbox, uid: number, user: string): Promise<SendResult> {
     const prev = this.queues.get(mailbox.id) ?? Promise.resolve();
-    const run = prev.catch(() => undefined).then(() => this.send(mailbox, uid));
+    const run = prev.catch(() => undefined).then(() => this.send(mailbox, uid, user));
     this.queues.set(mailbox.id, run);
     return run;
   }
 
-  private async send(mailbox: Mailbox, uid: number): Promise<SendResult> {
+  private async send(mailbox: Mailbox, uid: number, user: string): Promise<SendResult> {
     const box = mailbox.box;
     const policy = box.send;
     if (!policy) throw new MailboxError(`Mailbox "${box.id}" is not configured to send`);
@@ -160,9 +164,9 @@ export class DraftSender {
       raw: outgoing
     });
     const subject = parsed.subject ?? '';
-    await this.log.record({ mailbox: box.id, at: now.getTime(), messageId, recipients, subject });
+    await this.log.record({ mailbox: box.id, user, at: now.getTime(), messageId, recipients, subject });
     console.log(
-      `[send] mailbox=${box.id} draft=${uid} message-id=${messageId} to=${recipients.join(',')} subject=${JSON.stringify(subject)}`
+      `[send] mailbox=${box.id} user=${user} draft=${uid} message-id=${messageId} to=${recipients.join(',')} subject=${JSON.stringify(subject)}`
     );
 
     // The message is out. Nothing below may throw, or a retry would look like

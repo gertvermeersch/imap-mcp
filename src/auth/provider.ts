@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { Response } from 'express';
 import { SignJWT, jwtVerify } from 'jose';
 import type {
@@ -12,19 +12,33 @@ import type {
 } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import type { Config } from '../config.js';
+import type { Config, UserConfig } from '../config.js';
 import { FileStore } from './store.js';
-import { verifyPassword } from './password.js';
-import { renderLoginPage } from './login-page.js';
-import { expandRequested, normalizeGranted, parseScope, supportedScopes } from './scopes.js';
+import { hashPassword, verifyPassword } from './password.js';
+import { renderConsentPage, renderLoginPage } from './login-page.js';
+import {
+  canReadAny,
+  effectiveScopes,
+  expandRequested,
+  parseScope,
+  supportedScopes,
+  userScopes
+} from './scopes.js';
 
-/** Outcome of an operator sign-in attempt at POST /login. */
+/** Outcome of a sign-in attempt at POST /login: the consent page, or why not. */
 export type LoginResult =
+  | { ok: true; page: string }
+  | { ok: false; reason: 'expired' | 'credentials' | 'too_many_attempts' | 'no_access'; error: string };
+
+/** Outcome of a consent submission at POST /consent. */
+export type ConsentResult =
   | { ok: true; redirectTo: string }
-  | { ok: false; reason: 'expired' | 'credentials' | 'too_many_attempts' | 'no_scope'; error: string };
+  | { ok: false; reason: 'expired'; error: string }
+  | { ok: false; reason: 'no_scope'; page: string };
 
 interface PendingAuthorization {
   clientId: string;
+  clientName: string;
   redirectUri: string;
   codeChallenge: string;
   scopes: string[];
@@ -35,7 +49,12 @@ interface PendingAuthorization {
   expiresAt: number;
 }
 
-interface IssuedCode extends PendingAuthorization {
+/** A request whose user has signed in; `scopes` is now what that user may be offered. */
+interface SignedInAuthorization extends PendingAuthorization {
+  user: string;
+}
+
+interface IssuedCode extends SignedInAuthorization {
   used: boolean;
 }
 
@@ -53,39 +72,52 @@ function b64url(buf: Buffer): string {
   return buf.toString('base64url');
 }
 
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
-}
-
 export class ImapMcpOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: FileStore;
   private readonly cfg: Config;
   private readonly secret: Uint8Array;
-  /** Authorization requests awaiting operator login. Short-lived, in memory. */
+  /** Authorization requests awaiting sign-in. Short-lived, in memory. */
   private readonly pending = new Map<string, PendingAuthorization>();
+  /**
+   * Signed-in requests awaiting consent, under a fresh id handed only to the
+   * browser that signed in: knowing the id /authorize printed is not enough to
+   * submit someone else's consent.
+   */
+  private readonly consents = new Map<string, SignedInAuthorization>();
   /** Issued authorization codes, single use, 60s. */
   private readonly codes = new Map<string, IssuedCode>();
+  private readonly users: Map<string, UserConfig>;
+  /**
+   * Checked in place of a real hash when the username is unknown, so that a
+   * wrong name costs the same scrypt as a wrong password and the response time
+   * does not tell which names exist.
+   */
+  private readonly decoyHash = hashPassword(randomBytes(16).toString('base64'));
 
   constructor(cfg: Config, store: FileStore) {
     this.cfg = cfg;
     this.clientsStore = store;
     this.secret = new TextEncoder().encode(cfg.JWT_SECRET);
+    this.users = new Map(cfg.users.map((u) => [u.id, u]));
     setInterval(() => this.sweep(), 60_000).unref();
   }
 
   private sweep(): void {
     const now = Date.now();
     for (const [k, v] of this.pending) if (v.expiresAt <= now) this.pending.delete(k);
+    for (const [k, v] of this.consents) if (v.expiresAt <= now) this.consents.delete(k);
     for (const [k, v] of this.codes) if (v.expiresAt <= now) this.codes.delete(k);
+  }
+
+  /** The user a token or refresh token belongs to, if they still exist. */
+  user(id: unknown): UserConfig | undefined {
+    return typeof id === 'string' ? this.users.get(id) : undefined;
   }
 
   /**
    * Step 1. The SDK has already validated the client, redirect_uri and PKCE
-   * challenge. We park the request and show the operator a login + consent
-   * page rather than redirecting straight back with a code.
+   * challenge. We park the request and show a sign-in page rather than
+   * redirecting straight back with a code.
    */
   async authorize(
     client: OAuthClientInformationFull,
@@ -108,8 +140,10 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
       return;
     }
 
+    const clientName = client.client_name ?? client.client_id;
     this.pending.set(requestId, {
       clientId: client.client_id,
+      clientName,
       redirectUri: params.redirectUri,
       codeChallenge: params.codeChallenge,
       scopes,
@@ -123,26 +157,15 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
       .status(200)
       .set('Content-Type', 'text/html; charset=utf-8')
       .set('Cache-Control', 'no-store')
-      .send(
-        renderLoginPage({
-          requestId,
-          clientName: client.client_name ?? client.client_id,
-          scopes,
-          mailboxes: this.cfg.mailboxes.map((m) => ({ id: m.id, address: m.address }))
-        })
-      );
+      .send(renderLoginPage({ requestId, clientName }));
   }
 
   /**
-   * Step 2. Called by our own POST /login route once the operator submits the
-   * form. Verifies the password, then redirects back to the client with a code.
+   * Step 2. Called by our own POST /login route once the user submits the
+   * sign-in form. Verifies the password, then hands back the consent page for
+   * that user's own mailboxes.
    */
-  async completeLogin(
-    requestId: string,
-    username: string,
-    password: string,
-    selectedScopes: string[] = []
-  ): Promise<LoginResult> {
+  async completeLogin(requestId: string, username: string, password: string): Promise<LoginResult> {
     const req = this.pending.get(requestId);
     if (!req || req.expiresAt <= Date.now()) {
       this.pending.delete(requestId);
@@ -153,9 +176,9 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
       };
     }
 
-    const userOk = safeEqual(username, this.cfg.OPERATOR_USERNAME);
-    const passOk = await verifyPassword(password, this.cfg.OPERATOR_PASSWORD_HASH);
-    if (!userOk || !passOk) {
+    const user = this.users.get(username);
+    const passOk = await verifyPassword(password, user?.passwordHash ?? (await this.decoyHash));
+    if (!user || !passOk) {
       req.attempts += 1;
       if (req.attempts >= MAX_LOGIN_ATTEMPTS) {
         this.pending.delete(requestId);
@@ -165,11 +188,65 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
           error: 'Too many failed attempts. Start the connection again from Claude.'
         };
       }
-      // Deliberately vague, and the request stays pending for a retry.
+      // Deliberately vague — the same words for an unknown name and a wrong
+      // password — and the request stays pending for a retry.
       return { ok: false, reason: 'credentials', error: 'Incorrect username or password.' };
     }
 
-    // The operator may narrow what the client asked for, never widen it. A
+    this.pending.delete(requestId);
+    // What the client asked for, cut down to what this user may grant. Without
+    // read on any mailbox nothing could be granted, so say so now rather than
+    // show a consent page that can only fail.
+    const offered = userScopes(user).filter((s) => req.scopes.includes(s));
+    if (!canReadAny(offered)) {
+      return {
+        ok: false,
+        reason: 'no_access',
+        error: `${user.id} has no access to the mailboxes this connection asked for.`
+      };
+    }
+
+    const consentId = b64url(randomBytes(24));
+    const signedIn: SignedInAuthorization = {
+      ...req,
+      user: user.id,
+      scopes: offered,
+      expiresAt: Date.now() + AUTH_REQUEST_TTL_MS
+    };
+    this.consents.set(consentId, signedIn);
+    return { ok: true, page: this.consentPage(consentId, signedIn) };
+  }
+
+  private consentPage(consentId: string, req: SignedInAuthorization, error?: string): string {
+    const mine = new Set(this.users.get(req.user)!.mailboxes.map((m) => m.id));
+    return renderConsentPage({
+      requestId: consentId,
+      clientName: req.clientName,
+      user: req.user,
+      scopes: req.scopes,
+      mailboxes: this.cfg.mailboxes
+        .filter((m) => mine.has(m.id))
+        .map((m) => ({ id: m.id, address: m.address })),
+      ...(error ? { error } : {})
+    });
+  }
+
+  /**
+   * Step 3. Called by our own POST /consent route with the boxes the signed-in
+   * user left ticked. Redirects back to the client with a code.
+   */
+  consent(consentId: string, selectedScopes: string[]): ConsentResult {
+    const req = this.consents.get(consentId);
+    if (!req || req.expiresAt <= Date.now()) {
+      this.consents.delete(consentId);
+      return {
+        ok: false,
+        reason: 'expired',
+        error: 'This authorization request expired. Start again from Claude.'
+      };
+    }
+
+    // The user may narrow what the client asked for, never widen it. A
     // write on a mailbox is only kept alongside read on that same mailbox: being
     // able to move or send in a mailbox you cannot look into makes no sense.
     const ticked = req.scopes.filter((s) => selectedScopes.includes(s));
@@ -178,16 +255,15 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
     );
     const scopes = ticked.filter((s) => readable.has(parseScope(s)?.mailbox ?? ''));
     if (scopes.length === 0) {
-      // The password was right, so this is not a guess: the request stays
-      // pending and the operator can go back and tick a mailbox.
+      // The request stays open and the page comes back so a mailbox can be ticked.
       return {
         ok: false,
         reason: 'no_scope',
-        error: 'Grant read access to at least one mailbox. Go back and tick it to continue.'
+        page: this.consentPage(consentId, req, 'Grant read access to at least one mailbox to continue.')
       };
     }
 
-    this.pending.delete(requestId);
+    this.consents.delete(consentId);
     const code = b64url(randomBytes(32));
     this.codes.set(code, { ...req, scopes, used: false, expiresAt: Date.now() + CODE_TTL_MS });
 
@@ -235,7 +311,7 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
 
     rec.used = true;
     this.codes.delete(authorizationCode);
-    return this.issueTokens(client.client_id, rec.scopes, rec.resource);
+    return this.issueTokens(client.client_id, rec.user, rec.scopes, rec.resource);
   }
 
   async exchangeRefreshToken(
@@ -252,6 +328,15 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
     }
     this.assertResourceMatches(resource?.toString() ?? rec.resource);
 
+    // Refresh tokens from before users existed carry no user; they were all
+    // issued to the operator, who is still the only user unless mailboxes.yml
+    // now lists users — then nobody can say whose they are.
+    const user = this.user(rec.user ?? (this.cfg.multiUser ? undefined : this.cfg.users[0]!.id));
+    if (!user) {
+      await this.clientsStore.deleteRefreshToken(refreshToken);
+      throw new InvalidGrantError('The user this connection was authorized by no longer exists; authorize it again');
+    }
+
     // Narrowing only: a refresh may not gain scopes it was not granted.
     const granted = rec.scopes;
     const requested = scopes?.length ? scopes : granted;
@@ -260,9 +345,16 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
       throw new InvalidGrantError(`Cannot widen scope to: ${widened.join(' ')}`);
     }
 
+    // And whatever mailboxes.yml has taken away from the user since stays gone.
+    const current = effectiveScopes(this.cfg, user, requested);
+    if (!canReadAny(current)) {
+      await this.clientsStore.deleteRefreshToken(refreshToken);
+      throw new InvalidGrantError(`${user.id} no longer has access to the mailboxes this connection was granted; authorize it again`);
+    }
+
     // Rotate: OAuth 2.1 requires rotation for public clients.
     await this.clientsStore.deleteRefreshToken(refreshToken);
-    return this.issueTokens(client.client_id, requested, rec.resource);
+    return this.issueTokens(client.client_id, user.id, current, rec.resource);
   }
 
   private assertResourceMatches(resource: string | undefined): void {
@@ -277,6 +369,7 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
 
   private async issueTokens(
     clientId: string,
+    user: string,
     scopes: string[],
     resource: string | undefined
   ): Promise<OAuthTokens> {
@@ -284,7 +377,7 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
     const accessToken = await new SignJWT({ scope: scopes.join(' ') })
       .setProtectedHeader({ alg: 'HS256', typ: 'at+jwt' })
       .setIssuer(this.cfg.OAUTH_ISSUER_URL)
-      .setSubject(this.cfg.OPERATOR_USERNAME)
+      .setSubject(user)
       .setAudience(this.cfg.MCP_RESOURCE_URL)
       .setIssuedAt(now)
       .setExpirationTime(now + this.cfg.ACCESS_TOKEN_TTL_SECONDS)
@@ -294,6 +387,7 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
     const refreshToken = b64url(randomBytes(32));
     await this.clientsStore.putRefreshToken(refreshToken, {
       clientId,
+      user,
       scopes,
       resource: resource ?? this.cfg.MCP_RESOURCE_URL,
       expiresAt: Date.now() + this.cfg.REFRESH_TOKEN_TTL_SECONDS * 1000
@@ -322,13 +416,20 @@ export class ImapMcpOAuthProvider implements OAuthServerProvider {
       throw new InvalidTokenError('Access token is invalid or expired');
     }
 
-    const scopes = normalizeGranted(this.cfg, String(payload.scope ?? '').split(' ').filter(Boolean));
+    // Every token names the user it was issued to (before users existed, that
+    // was always the operator, whose name is the one user's id). A user who
+    // has since been removed from mailboxes.yml holds nothing.
+    const user = this.user(payload.sub);
+    if (!user) throw new InvalidTokenError('Access token belongs to a user who no longer exists');
+
+    const scopes = effectiveScopes(this.cfg, user, String(payload.scope ?? '').split(' ').filter(Boolean));
     return {
       token,
       clientId: String(payload.aud),
       scopes,
       expiresAt: typeof payload.exp === 'number' ? payload.exp : undefined,
-      resource: new URL(this.cfg.MCP_RESOURCE_URL)
+      resource: new URL(this.cfg.MCP_RESOURCE_URL),
+      extra: { user: user.id }
     };
   }
 

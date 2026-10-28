@@ -313,18 +313,25 @@ try {
   });
   check('wrong password is rejected', badLogin.status === 401, `status ${badLogin.status}`);
 
-  const goodLogin = await fetch(`${ORIGIN}/login`, {
+  const signIn = await fetch(`${ORIGIN}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ request_id: requestId, username: OPERATOR.username, password: OPERATOR.password }),
+    redirect: 'manual'
+  });
+  const consentHtml = await signIn.text();
+  check('correct password shows the consent page', signIn.status === 200 && consentHtml.includes('action="/consent"'), `status ${signIn.status}`);
+
+  const goodLogin = await fetch(`${ORIGIN}/consent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams([
-      ['request_id', requestId],
-      ['username', OPERATOR.username],
-      ['password', OPERATOR.password],
+      ['request_id', consentHtml.match(/name="request_id" value="([^"]+)"/)?.[1]],
       ...SCOPES.map((s) => ['scope', s])
     ]),
     redirect: 'manual'
   });
-  check('correct password redirects back to the client', goodLogin.status === 302, `status ${goodLogin.status}`);
+  check('consent redirects back to the client', goodLogin.status === 302, `status ${goodLogin.status}`);
   const cb = new URL(goodLogin.headers.get('location'));
   const code = cb.searchParams.get('code');
   check('redirect carries an authorization code', !!code);
@@ -679,13 +686,23 @@ try {
     })) au.searchParams.set(k, val);
     const page = await (await fetch(au)).text();
     const granted = ['mail:read:personal', 'mail:read:agent', 'mail:draft:agent', 'mail:move:agent', 'mail:send:agent'];
-    const li = await fetch(`${MULTI_ORIGIN}/login`, {
+    const consentPage = await (
+      await fetch(`${MULTI_ORIGIN}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          request_id: page.match(/name="request_id" value="([^"]+)"/)?.[1],
+          username: OPERATOR.username,
+          password: OPERATOR.password
+        }),
+        redirect: 'manual'
+      })
+    ).text();
+    const li = await fetch(`${MULTI_ORIGIN}/consent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams([
-        ['request_id', page.match(/name="request_id" value="([^"]+)"/)?.[1]],
-        ['username', OPERATOR.username],
-        ['password', OPERATOR.password],
+        ['request_id', consentPage.match(/name="request_id" value="([^"]+)"/)?.[1]],
         ...granted.map((s) => ['scope', s])
       ]),
       redirect: 'manual'

@@ -14,6 +14,22 @@
 # Use the part before the @ as the id so existing tokens keep their grants.
 # ---------------------------------------------------------------------------
 
+# Optional. Without users:, the OPERATOR_USERNAME login in .env gets every
+# mailbox. With it, each user signs in with their own password and sees only
+# the mailboxes listed here; remove OPERATOR_USERNAME and OPERATOR_PASSWORD_HASH
+# from .env. Never put a hash or password here: name the env var that holds the
+# hash from hash-password.
+#
+# users:
+#   gert:                                   # the username to sign in with
+#     passwordHashEnv: PASSWORD_HASH_GERT
+#     mailboxes:                            # per mailbox, what this user may do
+#       personal: [read, draft, mark, move]
+#       agent: [read, draft, send]
+#   anna:
+#     passwordHashEnv: PASSWORD_HASH_ANNA
+#     mailboxes: [info]                     # shorthand: whatever the mailbox offers
+
 mailboxes:
   # The id (personal, info, agent) is what tools and scopes use: mail:read:personal.
   personal:

@@ -4,7 +4,8 @@
  * Unlike test/smoke.mjs this needs no IMAP server and no Java — every path it
  * exercises is refused before the mailbox is ever touched. It boots the real
  * dist/index.js in several configurations — one mailbox with various switches
- * off, and three mailboxes — and drives the OAuth flow the way a client does.
+ * off, three mailboxes, and two users — and drives the OAuth flow the way a
+ * client does.
  *
  * Usage: node test/auth.mjs   (expects a built dist/)
  */
@@ -144,20 +145,53 @@ function api(srv) {
       };
     },
 
-    /** `scopes` are the boxes left ticked on the consent page. */
-    login(requestId, password, scopes = []) {
-      const body = new URLSearchParams({
-        request_id: requestId,
-        username: OPERATOR.username,
-        password
+    /** Submits the sign-in form; a 200 is the consent page, whose own request id it returns. */
+    async signIn(requestId, password, username = OPERATOR.username) {
+      const res = await fetch(`${srv.origin}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ request_id: requestId, username, password }),
+        redirect: 'manual'
       });
+      const html = await res.text();
+      return { res, html, consentId: res.status === 200 ? html.match(/name="request_id" value="([^"]+)"/)?.[1] : undefined };
+    },
+
+    /** `scopes` are the boxes left ticked on the consent page. */
+    consent(consentId, scopes = []) {
+      const body = new URLSearchParams({ request_id: consentId });
       for (const s of scopes) body.append('scope', s);
-      return fetch(`${srv.origin}/login`, {
+      return fetch(`${srv.origin}/consent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body,
         redirect: 'manual'
       });
+    },
+
+    /**
+     * Signs in and, if that worked, consents with `scopes`. Returns the final
+     * response: the redirect with a code, or whichever step refused.
+     */
+    async login(requestId, password, scopes = [], username = OPERATOR.username) {
+      const s = await this.signIn(requestId, password, username);
+      if (!s.consentId) return new Response(s.html, { status: s.res.status, headers: s.res.headers });
+      return this.consent(s.consentId, scopes);
+    },
+
+    /** /authorize then sign-in: the consent page `username` is shown for `scope`. */
+    async consentPage(clientId, scope, username = OPERATOR.username, password = OPERATOR.password) {
+      const a = await this.startAuth(clientId, scope);
+      const s = await this.signIn(a.requestId, password, username);
+      return { ...s, verifier: a.verifier, loginHtml: a.html };
+    },
+
+    /** The whole flow, ending in a token response. */
+    async grant(clientId, scope, ticked, username = OPERATOR.username, password = OPERATOR.password) {
+      const p = await this.consentPage(clientId, scope, username, password);
+      const l = await this.consent(p.consentId, ticked);
+      const code = new URL(l.headers.get('location')).searchParams.get('code');
+      return this.token(clientId, code, p.verifier);
     },
 
     async token(clientId, code, verifier) {
@@ -174,16 +208,30 @@ function api(srv) {
         })
       });
       return res.json();
+    },
+
+    async refresh(clientId, refreshToken) {
+      const res = await fetch(`${srv.origin}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: clientId,
+          resource: srv.resource
+        })
+      });
+      return { status: res.status, json: await res.json() };
     }
   };
 }
 
 /** Mints an access token the way the server does, for scopes the flow cannot produce (legacy ones). */
-function mint(srv, scope) {
+function mint(srv, scope, sub = OPERATOR.username) {
   return new SignJWT({ scope })
     .setProtectedHeader({ alg: 'HS256', typ: 'at+jwt' })
     .setIssuer(`${srv.origin}/`)
-    .setSubject(OPERATOR.username)
+    .setSubject(sub)
     .setAudience(srv.resource)
     .setIssuedAt()
     .setExpirationTime('1h')
@@ -258,12 +306,26 @@ async function draftsEnabled() {
     const auth = await c.startAuth(client.client_id, 'mail:read:mailbox');
     check('login page renders for a read-only request', !!auth.requestId);
     check(
-      'consent page lists only the read scope',
-      auth.html.includes('mail:read:mailbox') && !auth.html.includes('mail:draft')
+      'the sign-in page names no scope: it cannot know whose mailboxes to show yet',
+      !auth.html.includes('mail:') && !auth.html.includes('mailbox@example.test')
     );
+    const signedIn = await c.signIn(auth.requestId, OPERATOR.password);
+    check(
+      'correct password answers with the consent page, under a new request id',
+      signedIn.res.status === 200 && !!signedIn.consentId && signedIn.consentId !== auth.requestId,
+      `status ${signedIn.res.status}`
+    );
+    check(
+      'consent page lists only the read scope',
+      signedIn.html.includes('mail:read:mailbox') && !signedIn.html.includes('mail:draft')
+    );
+    const reused = await c.signIn(auth.requestId, OPERATOR.password);
+    check('the sign-in request id is spent once signed in', reused.res.status === 401, `status ${reused.res.status}`);
+    const hijack = await c.consent(auth.requestId, ['mail:read:mailbox']);
+    check('the sign-in request id cannot submit consent', hijack.status === 401, `status ${hijack.status}`);
 
-    const login = await c.login(auth.requestId, OPERATOR.password, ['mail:read:mailbox']);
-    check('correct password redirects with a code', login.status === 302, `status ${login.status}`);
+    const login = await c.consent(signedIn.consentId, ['mail:read:mailbox']);
+    check('consent redirects with a code', login.status === 302, `status ${login.status}`);
     const code = new URL(login.headers.get('location')).searchParams.get('code');
 
     const tok = await c.token(client.client_id, code, auth.verifier);
@@ -348,19 +410,19 @@ async function draftsEnabled() {
       readText.slice(0, 120)
     );
 
-    const scopeless = await c.startAuth(client.client_id, undefined);
+    const scopeless = await c.consentPage(client.client_id, undefined);
     check(
       'a scopeless request is offered everything on offer',
       ALL.every((s) => scopeless.html.includes(s))
     );
 
-    const legacy = await c.startAuth(client.client_id, 'mail:read mail:draft');
+    const legacy = await c.consentPage(client.client_id, 'mail:read mail:draft');
     check(
       'a legacy unqualified request is offered those capabilities on the mailbox',
       legacy.html.includes('value="mail:read:mailbox"') &&
         legacy.html.includes('value="mail:draft:mailbox"') &&
         !legacy.html.includes('mail:mark'),
-      legacy.res.status
+      String(legacy.res.status)
     );
 
     // Tokens from before scopes named a mailbox must keep working after the upgrade.
@@ -382,13 +444,8 @@ async function draftsEnabled() {
     );
 
     console.log('\nDrafts enabled — operator picks the scopes');
-    const pick = async (requested, ticked) => {
-      const a = await c.startAuth(client.client_id, requested);
-      const l = await c.login(a.requestId, OPERATOR.password, ticked);
-      const cd = new URL(l.headers.get('location')).searchParams.get('code');
-      return (await c.token(client.client_id, cd, a.verifier)).scope;
-    };
-    const everything = await c.startAuth(client.client_id, ALL.join(' '));
+    const pick = async (requested, ticked) => (await c.grant(client.client_id, requested, ticked)).scope;
+    const everything = await c.consentPage(client.client_id, ALL.join(' '));
     check(
       'consent page has a checkbox per requested scope',
       (everything.html.match(/type="checkbox" name="scope"/g) ?? []).length === 4
@@ -407,19 +464,26 @@ async function draftsEnabled() {
         'mail:read:mailbox'
     );
 
-    const empty = await c.startAuth(client.client_id, ALL.join(' '));
-    const emptyLogin = await c.login(empty.requestId, OPERATOR.password, ['mail:mark:mailbox']);
+    const empty = await c.consentPage(client.client_id, ALL.join(' '));
+    const emptyLogin = await c.consent(empty.consentId, ['mail:mark:mailbox']);
+    const emptyHtml = await emptyLogin.text();
     check(
-      'a grant without read on any mailbox is refused',
-      emptyLogin.status === 401 && (await emptyLogin.text()).includes('at least one mailbox'),
+      'a grant without read on any mailbox is refused, back on the consent page',
+      emptyLogin.status === 400 && emptyHtml.includes('at least one mailbox') && emptyHtml.includes('action="/consent"'),
       `status ${emptyLogin.status}`
     );
-    const retry = await c.login(empty.requestId, OPERATOR.password, ['mail:read:mailbox']);
+    const retry = await c.consent(empty.consentId, ['mail:read:mailbox']);
     check('...without burning the request: ticking read then succeeds', retry.status === 302, `status ${retry.status}`);
 
     console.log('\nDrafts enabled — login throttling');
     const target = await c.startAuth(client.client_id, 'mail:read:mailbox');
-    for (let i = 1; i <= 5; i++) {
+    const nobody = await c.signIn(target.requestId, OPERATOR.password, 'nobody');
+    check(
+      'an unknown username gets the same answer as a wrong password',
+      nobody.res.status === 401 && nobody.html.includes('Incorrect username or password'),
+      `status ${nobody.res.status}`
+    );
+    for (let i = 2; i <= 5; i++) {
       const res = await c.login(target.requestId, `wrong-${i}`);
       const body = await res.text();
       if (i < 5) {
@@ -487,7 +551,7 @@ async function draftsDisabled() {
       );
     }
 
-    const scopeless = await c.startAuth(client.client_id, undefined);
+    const scopeless = await c.consentPage(client.client_id, undefined);
     check(
       'a scopeless request is offered everything except mail:draft',
       scopeless.html.includes('mail:read:mailbox') &&
@@ -595,7 +659,7 @@ async function multiMailbox() {
       JSON.stringify(meta.scopes_supported)
     );
 
-    const all = await c.startAuth(client.client_id, undefined);
+    const all = await c.consentPage(client.client_id, undefined);
     check(
       'consent page groups the scopes by mailbox',
       ['personal@example.test', 'info@example.test', 'agent@example.test'].every((a) =>
@@ -609,12 +673,7 @@ async function multiMailbox() {
     );
     check('consent page says sending is drafts-only', all.html.includes('already in Drafts'));
 
-    const grant = async (ticked) => {
-      const a = await c.startAuth(client.client_id, undefined);
-      const l = await c.login(a.requestId, OPERATOR.password, ticked);
-      const cd = new URL(l.headers.get('location')).searchParams.get('code');
-      return c.token(client.client_id, cd, a.verifier);
-    };
+    const grant = (ticked) => c.grant(client.client_id, undefined, ticked);
     const tok = await grant([
       'mail:read:personal',
       'mail:mark:personal',
@@ -693,7 +752,7 @@ async function multiMailbox() {
     });
     check('a grant on one mailbox does not carry over to another', text(personalMark).includes('mail:read:personal'), text(personalMark));
 
-    const legacy = await c.startAuth(client.client_id, 'mail:read');
+    const legacy = await c.consentPage(client.client_id, 'mail:read');
     check(
       'a legacy mail:read request is offered read on every mailbox',
       ['personal', 'info', 'agent'].every((m) => legacy.html.includes(`value="mail:read:${m}"`)) &&
@@ -707,6 +766,177 @@ async function multiMailbox() {
       JSON.stringify(oldList?.map((m) => m.access)) === '[["read","draft"],[],[]]',
       JSON.stringify(oldList?.map((m) => m.access))
     );
+  } finally {
+    await srv.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+const USERS_YAML = `
+users:
+  gert:
+    passwordHashEnv: HASH_GERT
+    mailboxes:
+      personal: [read, draft, mark, move]
+      info: [read, draft]
+  anna:
+    passwordHashEnv: HASH_ANNA
+    mailboxes: [info]
+mailboxes:
+  personal:
+    address: personal@example.test
+    passwordEnv: PW_PERSONAL
+    capabilities: [read, draft, mark, move]
+  info:
+    address: info@example.test
+    passwordEnv: PW_INFO
+    capabilities: [read, draft, mark]
+`;
+const GERT = { username: 'gert', password: 'gert-password-1' };
+const ANNA = { username: 'anna', password: 'anna-password-2' };
+
+async function multiUser() {
+  console.log('\nTwo users from mailboxes.yml — each sees only their own mailboxes');
+  const dir = await mkdtemp(join(tmpdir(), 'imap-mcp-users-'));
+  const file = join(dir, 'mailboxes.yml');
+  await writeFile(file, USERS_YAML);
+  const srv = await startServer(8798, {
+    MAILBOXES_CONFIG: file,
+    // users: replaces the operator login; blank is unset, as in an env file.
+    OPERATOR_USERNAME: '',
+    OPERATOR_PASSWORD_HASH: '',
+    HASH_GERT: await hashPassword(GERT.password),
+    HASH_ANNA: await hashPassword(ANNA.password),
+    PW_PERSONAL: 'unused',
+    PW_INFO: 'unused'
+  });
+  const c = api(srv);
+  const init = (t) =>
+    rpc(srv, t, 'initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'auth-test', version: '0' }
+    });
+  try {
+    const client = await c.register('auth-test-users');
+
+    const prm = await (await fetch(`${srv.origin}/.well-known/oauth-protected-resource/mcp`)).json();
+    check('the public metadata names no address', prm.resource_name === 'IMAP mail', prm.resource_name);
+
+    const annaPage = await c.consentPage(client.client_id, undefined, ANNA.username, ANNA.password);
+    check(
+      'the sign-in page names no mailbox',
+      !annaPage.loginHtml.includes('@example.test') && !annaPage.loginHtml.includes('mail:')
+    );
+    check(
+      "anna's consent page shows info, everything it offers, and nothing of personal",
+      annaPage.res.status === 200 &&
+        ['mail:read:info', 'mail:draft:info', 'mail:mark:info'].every((s) => annaPage.html.includes(`value="${s}"`)) &&
+        annaPage.html.includes('info@example.test') &&
+        !annaPage.html.includes('personal') &&
+        annaPage.html.includes('Signed in as <strong>anna</strong>'),
+      annaPage.html.slice(0, 200)
+    );
+
+    const gertPage = await c.consentPage(client.client_id, undefined, GERT.username, GERT.password);
+    check(
+      "gert's consent page narrows info to what his entry lists",
+      ['mail:read:personal', 'mail:move:personal', 'mail:read:info', 'mail:draft:info'].every((s) =>
+        gertPage.html.includes(`value="${s}"`)
+      ) && !gertPage.html.includes('mail:mark:info')
+    );
+
+    const forged = await c.consent(annaPage.consentId, ['mail:read:info', 'mail:read:personal', 'mail:move:personal']);
+    const forgedCode = new URL(forged.headers.get('location')).searchParams.get('code');
+    const annaTok = await c.token(client.client_id, forgedCode, annaPage.verifier);
+    check(
+      "ticking another user's mailbox in a forged form grants nothing there",
+      annaTok.scope === 'mail:read:info',
+      annaTok.scope
+    );
+
+    const t = annaTok.access_token;
+    const hello = await init(t);
+    check(
+      "the server instructions name only anna's mailbox",
+      (hello.result?.instructions ?? '').includes('info@example.test') &&
+        !(hello.result?.instructions ?? '').includes('personal'),
+      hello.result?.instructions
+    );
+    const tools = (await rpc(srv, t, 'tools/list', {})).result?.tools ?? [];
+    const search = tools.find((x) => x.name === 'search_messages');
+    check(
+      'with one mailbox of her own, the mailbox argument is optional and only names it',
+      !search?.inputSchema?.required?.includes('mailbox') &&
+        JSON.stringify(search?.inputSchema?.properties?.mailbox?.enum) === '["info"]',
+      JSON.stringify(search?.inputSchema?.properties?.mailbox)
+    );
+    check(
+      'move_messages does not exist for her: none of her mailboxes moves',
+      !tools.some((x) => x.name === 'move_messages')
+    );
+    const listed = json(await rpc(srv, t, 'tools/call', { name: 'list_mailboxes', arguments: {} }));
+    check(
+      'list_mailboxes lists only her mailbox',
+      JSON.stringify(listed?.map((m) => m.id)) === '["info"]' && JSON.stringify(listed?.[0]?.access) === '["read"]',
+      JSON.stringify(listed)
+    );
+    const dflt = await rpc(srv, t, 'tools/call', { name: 'search_messages', arguments: {} });
+    check(
+      'leaving out the mailbox means her one mailbox (passes the scope check, then fails on the dead IMAP host)',
+      dflt.result?.isError === true && !text(dflt).includes('scope') && !text(dflt).includes('Unknown mailbox'),
+      text(dflt)
+    );
+    const other = await rpc(srv, t, 'tools/call', { name: 'search_messages', arguments: { mailbox: 'personal' } });
+    // Refused as an argument that does not exist, before any IMAP connection.
+    const otherText = other.error?.message ?? text(other);
+    check(
+      "naming another user's mailbox is refused as a mailbox that is not hers",
+      (other.result?.isError === true || !!other.error) && otherText.includes('"info"') && !otherText.includes('Mailbox operation failed'),
+      JSON.stringify(other).slice(0, 300)
+    );
+
+    // A token carrying more than its user may grant — signed with the real
+    // secret, as if mailboxes.yml took a mailbox away after it was issued.
+    const stale = await mint(srv, 'mail:read:info mail:read:personal mail:move:personal', 'anna');
+    const staleList = json(await rpc(srv, stale, 'tools/call', { name: 'list_mailboxes', arguments: {} }));
+    check(
+      "scopes a user may no longer grant are dropped from her token",
+      JSON.stringify(staleList?.map((m) => m.id)) === '["info"]',
+      JSON.stringify(staleList)
+    );
+    for (const [who, label] of [
+      ['mallory', 'a token for a user who does not exist is refused'],
+      [OPERATOR.username, 'with users: the operator login is gone, and so are its tokens']
+    ]) {
+      const ghost = await rpc(srv, await mint(srv, 'mail:read:info', who), 'tools/list', {});
+      check(label, ghost.status === 401, `status ${ghost.status}`);
+    }
+
+    const refreshed = await c.refresh(client.client_id, annaTok.refresh_token);
+    check(
+      'a refresh keeps the user: same scope, same mailbox',
+      refreshed.status === 200 && refreshed.json.scope === 'mail:read:info',
+      JSON.stringify(refreshed.json).slice(0, 200)
+    );
+    const afterRefresh = json(
+      await rpc(srv, refreshed.json.access_token, 'tools/call', { name: 'list_mailboxes', arguments: {} })
+    );
+    check(
+      '...and the refreshed token still sees only her mailbox',
+      JSON.stringify(afterRefresh?.map((m) => m.id)) === '["info"]',
+      JSON.stringify(afterRefresh)
+    );
+
+    const notHers = await c.startAuth(client.client_id, 'mail:read:personal');
+    const refused = await c.signIn(notHers.requestId, ANNA.password, ANNA.username);
+    check(
+      'a request only for mailboxes she lacks is refused after sign-in, not shown empty',
+      refused.res.status === 403 && refused.html.includes('has no access'),
+      `status ${refused.res.status}`
+    );
+    const wrongUser = await c.signIn((await c.startAuth(client.client_id, undefined)).requestId, ANNA.password, GERT.username);
+    check("anna's password does not sign in as gert", wrongUser.res.status === 401, `status ${wrongUser.res.status}`);
   } finally {
     await srv.stop();
     await rm(dir, { recursive: true, force: true });
@@ -787,6 +1017,55 @@ async function badConfig() {
       hiddenSent.status !== 0 && hiddenSent.stderr.includes('"Sent"'),
       hiddenSent.stderr.slice(-200)
     );
+
+    const box = 'mailboxes:\n  a:\n    address: a@example.test\n    passwordEnv: PW_A\n    capabilities: [read, draft]\n';
+    const noOperator = { OPERATOR_USERNAME: '', OPERATOR_PASSWORD_HASH: '', PW_A: 'x' };
+    const hash = await hashPassword('x');
+    const noLogin = await run(box, noOperator);
+    check(
+      'without users: or the OPERATOR_* login, startup stops',
+      noLogin.status !== 0 && noLogin.stderr.includes('OPERATOR_USERNAME and OPERATOR_PASSWORD_HASH must be set'),
+      noLogin.stderr.slice(-200)
+    );
+    const both = await run(`users:\n  u:\n    passwordHashEnv: HASH_U\n    mailboxes: [a]\n${box}`, { PW_A: 'x', HASH_U: hash });
+    check(
+      'users: together with a leftover OPERATOR_* login stops startup',
+      both.status !== 0 && both.stderr.includes('users: replaces them'),
+      both.stderr.slice(-200)
+    );
+    const unknownBox = await run(`users:\n  u:\n    passwordHashEnv: HASH_U\n    mailboxes: [a, nope]\n${box}`, {
+      ...noOperator,
+      HASH_U: hash
+    });
+    check(
+      'a user given a mailbox that does not exist stops startup',
+      unknownBox.status !== 0 && unknownBox.stderr.includes('there is no mailbox "nope"'),
+      unknownBox.stderr.slice(-200)
+    );
+    const tooMuch = await run(`users:\n  u:\n    passwordHashEnv: HASH_U\n    mailboxes:\n      a: [read, send]\n${box}`, {
+      ...noOperator,
+      HASH_U: hash
+    });
+    check(
+      'a user given a capability the mailbox does not offer stops startup',
+      tooMuch.status !== 0 && tooMuch.stderr.includes('mailbox "a" does not offer "send"'),
+      tooMuch.stderr.slice(-200)
+    );
+    const noHash = await run(`users:\n  u:\n    passwordHashEnv: HASH_NOT_SET_ANYWHERE\n    mailboxes: [a]\n${box}`, noOperator);
+    check(
+      "a user whose hash variable is unset stops startup",
+      noHash.status !== 0 && noHash.stderr.includes('HASH_NOT_SET_ANYWHERE'),
+      noHash.stderr.slice(-200)
+    );
+    const plain = await run(`users:\n  u:\n    passwordHashEnv: HASH_U\n    mailboxes: [a]\n${box}`, {
+      ...noOperator,
+      HASH_U: 'a plaintext password, not a hash'
+    });
+    check(
+      'a plaintext password where the hash should be stops startup',
+      plain.status !== 0 && plain.stderr.includes('is not a hash from hash-password'),
+      plain.stderr.slice(-200)
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -796,6 +1075,7 @@ await draftsEnabled();
 await draftsDisabled();
 await writesDisabled();
 await multiMailbox();
+await multiUser();
 await badConfig();
 
 console.log(`\n${passed} passed, ${failed} failed`);

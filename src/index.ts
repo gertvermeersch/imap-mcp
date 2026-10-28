@@ -83,7 +83,11 @@ app.use(
     provider,
     issuerUrl: new URL(cfg.OAUTH_ISSUER_URL),
     resourceServerUrl: resourceUrl,
-    resourceName: `IMAP mailbox (${cfg.mailboxes.map((m) => m.address).join(', ')})`,
+    // Anyone can read this document, so with several users it names nobody's
+    // addresses; the consent page shows each user their own.
+    resourceName: cfg.multiUser
+      ? 'IMAP mail'
+      : `IMAP mailbox (${cfg.mailboxes.map((m) => m.address).join(', ')})`,
     scopesSupported: supportedScopes(cfg)
   })
 );
@@ -100,8 +104,8 @@ const GLOBAL_KEY = '*';
 const loginFailuresByIp = new FailureThrottle(5, LOGIN_WINDOW_MS);
 const loginFailuresGlobal = new FailureThrottle(20, LOGIN_WINDOW_MS);
 
-// The operator login form posts here; the OAuth provider turns a successful
-// login into an authorization code and redirects back to the client.
+// The sign-in form posts here; a successful sign-in answers with the consent
+// page for that user's mailboxes, which posts to /consent.
 app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
   const { request_id: requestId, username, password } = req.body ?? {};
   if (
@@ -134,28 +138,54 @@ app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async 
     return;
   }
 
+  const result = await provider.completeLogin(requestId, username, password);
+  if (!result.ok) {
+    // An expired request never reached a password check, and a user with no
+    // access got the password right, so neither is a guess and neither may
+    // count against the sign-in throttle.
+    if (result.reason !== 'expired' && result.reason !== 'no_access') {
+      loginFailuresByIp.recordFailure(ip);
+      loginFailuresGlobal.recordFailure(GLOBAL_KEY);
+      console.warn(`[auth] failed login from ${ip} (${result.reason})`);
+    }
+    res
+      .status(result.reason === 'no_access' ? 403 : 401)
+      .type('html')
+      .set('Cache-Control', 'no-store')
+      .send(renderErrorPage(result.error));
+    return;
+  }
+
+  loginFailuresByIp.clear(ip);
+  res.status(200).type('html').set('Cache-Control', 'no-store').send(result.page);
+});
+
+// The consent form posts here; the OAuth provider turns the ticked scopes into
+// an authorization code and redirects back to the client. Its request id is
+// only ever handed to a browser that just signed in, so there is no password
+// to guess here and nothing to throttle.
+app.post('/consent', express.urlencoded({ extended: false, limit: '4kb' }), (req, res) => {
+  const requestId: unknown = req.body?.request_id;
+  if (typeof requestId !== 'string') {
+    res.status(400).type('html').send(renderErrorPage('Malformed consent request.'));
+    return;
+  }
+
   // One checkbox field per ticked scope: a string for one, an array for several.
   const ticked: unknown = req.body?.scope;
   const selectedScopes = (Array.isArray(ticked) ? ticked : [ticked]).filter(
     (s): s is string => typeof s === 'string'
   );
 
-  const result = await provider.completeLogin(requestId, username, password, selectedScopes);
-  if (!result.ok) {
-    // An expired request never reached a password check, and an empty scope
-    // selection got the password right, so neither is a guess and neither may
-    // count against the operator.
-    if (result.reason !== 'expired' && result.reason !== 'no_scope') {
-      loginFailuresByIp.recordFailure(ip);
-      loginFailuresGlobal.recordFailure(GLOBAL_KEY);
-      console.warn(`[auth] failed login from ${ip} (${result.reason})`);
-    }
-    res.status(401).type('html').set('Cache-Control', 'no-store').send(renderErrorPage(result.error));
-    return;
+  const result = provider.consent(requestId, selectedScopes);
+  res.set('Cache-Control', 'no-store');
+  if (result.ok) {
+    res.redirect(302, result.redirectTo);
+  } else if (result.reason === 'no_scope') {
+    res.status(400).type('html').send(result.page);
+  } else {
+    res.status(401).type('html').send(renderErrorPage(result.error));
   }
-
-  loginFailuresByIp.clear(ip);
-  res.set('Cache-Control', 'no-store').redirect(302, result.redirectTo);
 });
 
 const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
@@ -188,7 +218,10 @@ const requireRead: express.RequestHandler = (req, res, next) => {
  * or round-robin this container without breaking a connector mid-conversation.
  */
 app.post('/mcp', bearer, requireRead, express.json({ limit: '4mb' }), async (req, res) => {
-  const server = buildMcpServer(cfg, mailboxes, sender);
+  // verifyAccessToken has already refused tokens of users who no longer exist.
+  const auth = (req as express.Request & { auth?: { extra?: { user?: unknown } } }).auth;
+  const user = provider.user(auth?.extra?.user)!;
+  const server = buildMcpServer(cfg, user, mailboxes, sender);
   // enableJsonResponse makes a request/response exchange come back as plain
   // application/json instead of a one-event SSE stream. Both are legal
   // Streamable HTTP, but JSON is what the stricter clients cope with, and this
@@ -243,6 +276,11 @@ const server = app.listen(cfg.PORT, () => {
       : '';
     console.log(
       `[imap-mcp] mailbox ${m.id}: ${m.imap.user}@${m.imap.host}:${m.imap.port} — ${m.capabilities.join(', ')}${send}`
+    );
+  }
+  for (const u of cfg.users) {
+    console.log(
+      `[imap-mcp] user ${u.id}: ${u.mailboxes.map((m) => `${m.id} (${m.capabilities.join(', ')})`).join('; ')}`
     );
   }
 });

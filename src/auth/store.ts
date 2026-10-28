@@ -5,6 +5,8 @@ import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/serv
 
 interface RefreshRecord {
   clientId: string;
+  /** Who authorized it. Absent on records written before there were users. */
+  user?: string;
   scopes: string[];
   resource?: string;
   expiresAt: number;
@@ -18,9 +20,9 @@ interface Persisted {
 const EMPTY: Persisted = { clients: {}, refreshTokens: {} };
 
 /**
- * Small JSON-file store. Single-instance by design: the whole point of this
- * server is one mailbox for one operator, so a file plus an in-process cache is
- * the right amount of machinery. Writes are atomic (write temp, rename).
+ * Small JSON-file store. Single-instance by design: this server holds a
+ * handful of mailboxes for a handful of people, so a file plus an in-process
+ * cache is the right amount of machinery. Writes are atomic (write temp, rename).
  */
 export class FileStore implements OAuthRegisteredClientsStore {
   private data: Persisted = structuredClone(EMPTY);

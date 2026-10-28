@@ -3,6 +3,8 @@ import { join } from 'node:path';
 
 export interface SendRecord {
   mailbox: string;
+  /** Whose connection sent it. Absent on records from before there were users. */
+  user?: string;
   /** Epoch milliseconds. */
   at: number;
   messageId: string;

@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { Capability, Config } from '../config.js';
+import type { Capability, Config, MailboxConfig, UserConfig } from '../config.js';
 import { Mailbox, MailboxError } from '../imap/mailbox.js';
 import { scopeFor } from '../auth/scopes.js';
 import type { DraftSender } from '../smtp/sender.js';
@@ -29,20 +29,29 @@ const ACTIONS: Record<Capability, string> = {
   send: 'send mail'
 };
 
+/**
+ * The MCP server one request talks to, built for the user its token belongs
+ * to: the tools, their mailbox arguments, the instructions and list_mailboxes
+ * only ever name that user's mailboxes, with what that user may do in each.
+ * Another user's mailboxes are not refused here — they do not exist here.
+ */
 export function buildMcpServer(
   cfg: Config,
+  user: UserConfig,
   mailboxes: Map<string, Mailbox>,
   sender: DraftSender
 ): McpServer {
-  const single = cfg.mailboxes.length === 1;
+  const byId = new Map(cfg.mailboxes.map((m) => [m.id, m]));
+  const visible: MailboxConfig[] = user.mailboxes.map((g) => ({ ...byId.get(g.id)!, capabilities: g.capabilities }));
+  const single = visible.length === 1;
   const withCapability = (cap: Capability) =>
-    cfg.mailboxes.filter((m) => m.capabilities.includes(cap)).map((m) => m.id);
+    visible.filter((m) => m.capabilities.includes(cap)).map((m) => m.id);
   const anySend = withCapability('send').length > 0;
 
   /**
    * The mailbox argument. With one mailbox it may be left out; with several it
    * is required, so a UID from one mailbox can never be applied to another by
-   * default. The enum lists only mailboxes this deployment gives `cap`.
+   * default. The enum lists only this user's mailboxes that offer `cap`.
    */
   const mailboxArg = (cap: Capability) => {
     const ids = withCapability(cap) as [string, ...string[]];
@@ -63,8 +72,8 @@ export function buildMcpServer(
     id: string | undefined,
     cap: Capability
   ): { mailbox: Mailbox } | { denied: ReturnType<typeof fail> } => {
-    const mailboxId = id ?? cfg.mailboxes[0]!.id;
-    const mailbox = mailboxes.get(mailboxId);
+    const mailboxId = id ?? visible[0]!.id;
+    const mailbox = visible.some((m) => m.id === mailboxId) ? mailboxes.get(mailboxId) : undefined;
     if (!mailbox) return { denied: fail(new MailboxError(`Unknown mailbox "${mailboxId}"`)) };
     for (const c of new Set<Capability>(['read', cap])) {
       const scope = scopeFor(c, mailboxId);
@@ -81,7 +90,7 @@ export function buildMcpServer(
     return { mailbox };
   };
 
-  const described = cfg.mailboxes
+  const described = visible
     .map((m) => `${m.id} (${m.address}): ${m.capabilities.join(', ')}`)
     .join('; ');
   const server = new McpServer(
@@ -106,14 +115,14 @@ export function buildMcpServer(
     {
       title: 'List mailboxes',
       description:
-        'List the mailboxes this server holds, with what this connection may do in each (read, draft, mark, move, send) and, where sending is granted, the recipient policy and daily limit.',
+        'List the mailboxes this connection\'s user has, with what this connection may do in each (read, draft, mark, move, send) and, where sending is granted, the recipient policy and daily limit.',
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false }
     },
     async (_args, extra) => {
       const granted = extra.authInfo?.scopes ?? [];
       return ok(
-        cfg.mailboxes.map((m) => {
+        visible.map((m) => {
           const access = m.capabilities.filter((c) => granted.includes(scopeFor(c, m.id)));
           return {
             id: m.id,
@@ -389,7 +398,7 @@ export function buildMcpServer(
         const o = open(extra, args.mailbox, 'send');
         if ('denied' in o) return o.denied;
         try {
-          return ok(await sender.sendDraft(o.mailbox, args.uid));
+          return ok(await sender.sendDraft(o.mailbox, args.uid, user.id));
         } catch (err) {
           return fail(err);
         }

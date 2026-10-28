@@ -1,6 +1,6 @@
 # imap-mcp
 
-A remote MCP server that gives Claude **read, draft, mark and move** access to one or more IMAP mailboxes, plus, for the mailboxes you choose, **sending a draft**. Authentication is OAuth 2.1. Each capability is its own scope per mailbox, so a single connector can read `personal@`, file mail in `info@` and send replies from `agent@` without any of those grants leaking into another mailbox.
+A remote MCP server that gives Claude **read, draft, mark and move** access to one or more IMAP mailboxes, plus, for the mailboxes you choose, **sending a draft**. Authentication is OAuth 2.1. Each capability is its own scope per mailbox, so a single connector can read `personal@`, file mail in `info@` and send replies from `agent@` without any of those grants leaking into another mailbox. One server can serve [several people](#users), each signing in with their own password and seeing only their own mailboxes.
 
 Built to sit behind Traefik reverse proxy: TypeScript, Docker, Traefik. So IMAP itself is never exposed to the internet — only this server's HTTPS endpoint is.
 
@@ -40,10 +40,11 @@ Switches that tighten it further:
 
 - **OAuth 2.1**, authorization code + PKCE, per the MCP authorization spec. The server is both authorization server and resource server.
 - **Audience binding (RFC 8707).** Access tokens are JWTs whose `aud` is this server's canonical URI. A token minted for any other resource is rejected — this is the check that stops a token from elsewhere being replayed here.
-- **One operator.** A single username plus an scrypt password hash. Registering an OAuth client is automatic; *authorizing* one always requires that human login.
+- **A human signs in.** Either one operator (`OPERATOR_USERNAME` plus an scrypt hash) or the [users](#users) listed in `mailboxes.yml`, each with their own hash. Registering an OAuth client is automatic; *authorizing* one always requires a human login. An unknown username costs the same scrypt as a wrong password and gets the same answer.
+- **Users only see their own mailboxes.** Every token names the user it was issued to. The tools, their `mailbox` arguments, the server instructions and `list_mailboxes` are built per request from that user's mailboxes, so another user's mailbox doesn't show up at all. Every request also trims the token's scopes to what its user may grant *now*. Taking a mailbox away from someone in `mailboxes.yml` therefore takes effect at the next restart, and a removed user's tokens stop working.
 - **Refresh token rotation**, single-use authorization codes (60s), `iss` in the callback per RFC 9207.
 - **Scopes are per mailbox, and enforced, not just advertised.** A scope names a capability and a mailbox, e.g. `mail:read:personal`, `mail:move:info` or `mail:send:agent`. Every tool call checks read on the mailbox it names, and a write also checks that write on the same mailbox. The scopes are independent: a token that can mark cannot move, and a grant on `info` says nothing about `personal`. The endpoint itself only requires read on at least one mailbox.
-- **The operator picks at sign-in.** The consent page groups a checkbox per requested scope under each mailbox. Everything starts ticked except send, which has to be ticked deliberately. The operator can narrow a grant, never widen it. A write on a mailbox is only granted together with read on that mailbox. Unticking every read is refused, and the request stays open so the operator can go back and tick one. The token response reports the narrower `scope`. A capability a mailbox doesn't have, or that an `ENABLE_*` switch turned off, is not advertised or grantable at all.
+- **The user picks after sign-in.** Signing in comes first, and the sign-in page names no mailbox. Only then does the consent page show a checkbox per requested scope, grouped under each of *that user's* mailboxes. The consent form gets a fresh request id that only the browser that signed in knows. Everything starts ticked except send, which has to be ticked deliberately. The user can narrow a grant, never widen it. A write on a mailbox is only granted together with read on that mailbox. Unticking every read brings the consent page back with an error, so one can be ticked. The token response reports the narrower `scope`. A capability a mailbox doesn't have, or that an `ENABLE_*` switch turned off, is not advertised or grantable at all.
 - **Upgrading keeps old connectors working.** Tokens and refresh tokens issued before scopes named a mailbox (`mail:read`, `mail:draft`, ...) are read as applying to the first mailbox, which is the one they were granted on. A client that still *requests* an unqualified `mail:read` is offered read on every mailbox. Re-authorize the connector to pick up other mailboxes or send.
 - **Sign-in throttling.** Five wrong passwords burn the authorization request, so further guesses cost a fresh `/authorize` round trip. Five failures from one address — or twenty across all addresses — lock the login form for 15 minutes with a `429` and a `Retry-After`. The counters are in memory and reset on restart.
 - Mailbox passwords live only in the container env. `mailboxes.yml` names the variable and never holds the password. They are never returned by a tool, never rendered in the login page, and never leave the server.
@@ -74,6 +75,34 @@ mailboxes:
 Each mailbox is a separate IMAP login with its own connection, folder allowlist, Drafts and Sent folders. Host, port and TLS come from the `IMAP_*` and `SMTP_*` env vars and can be overridden per mailbox. Startup fails if the file is invalid, if a password variable is unset, or if a sending mailbox has no SMTP host or hides Drafts or Sent from its own allowlist. The first mailbox is the default that pre-upgrade tokens map to.
 
 **Coming from `IMAP_USER`/`IMAP_PASSWORD`?** Those are no longer read; the file is required even for one mailbox. Describe the mailbox in `mailboxes.yml`, use the part of the address before the `@` as its id so existing tokens keep their grants, and rename `IMAP_PASSWORD` to the variable the entry's `passwordEnv` names. The old setup gave that mailbox `read`, `draft`, `mark` and `move`; list them under `capabilities:` to keep the same behaviour.
+
+## Users
+
+Without a `users:` section, the one `OPERATOR_USERNAME` login gets every mailbox, as before. To let several people share the server, list them in `mailboxes.yml` and remove `OPERATOR_USERNAME` and `OPERATOR_PASSWORD_HASH` from `.env`. Startup refuses to run with both, because the leftover login would look like an all-mailbox account that no longer exists.
+
+```yaml
+users:
+  gert:                                   # the username to sign in with
+    passwordHashEnv: PASSWORD_HASH_GERT   # env var holding the hash from hash-password
+    mailboxes:                            # per mailbox, what this user may do in it
+      personal: [read, draft, mark, move]
+      info: [read, draft]
+  anna:
+    passwordHashEnv: PASSWORD_HASH_ANNA
+    mailboxes: [info]                     # shorthand: whatever the mailbox offers
+
+mailboxes:
+  personal: ...
+  info: ...
+```
+
+What a user can do in a mailbox is the mailbox's `capabilities`, narrowed by the user's entry, narrowed again by the `ENABLE_*` switches. `read` is always included. Several users can share a mailbox. Its folder allowlist, sending policy and daily `maxPerDay` belong to the mailbox, so users who share a sending mailbox share its cap. Each send is logged with the user who sent it. Startup fails if a user names a mailbox that doesn't exist, asks for a capability the mailbox doesn't offer, or has an unset or plaintext hash variable.
+
+A user with one mailbox may leave out the `mailbox` argument. The public OAuth metadata doesn't list addresses in this mode, but `scopes_supported` still names every mailbox id, so pick ids that don't give anything away.
+
+**Switching from the operator login?** Name the user after your old `OPERATOR_USERNAME` and your existing connector keeps working. It can never see more than that user's entry allows. Refresh tokens issued by older versions don't record a user. They keep working for as long as the operator login is in use, and pick up the user the next time they rotate. Go straight from an older version to `users:` and the connector has to be re-authorized once.
+
+**Users are separated from each other, not from whoever runs the server.** Every mailbox's app password sits in the same container environment, so the administrator can read all of the mail. Only host this for people who are fine with that.
 
 ## Sending
 
@@ -111,12 +140,13 @@ Also `cp mailboxes.example.yml mailboxes.yml` and edit it down to your mailboxes
 
 `MCP_RESOURCE_URL` must be **exactly** the URL you give claude.ai, including `/mcp`, with no trailing slash. It is the OAuth resource indicator and the JWT audience; a mismatch shows up as tokens being refused.
 
-**3. Generate the operator password hash.**
+**3. Generate the password hash.** One per person who signs in.
 
 ```bash
 docker compose build
 docker compose run --rm imap-mcp node dist/tools/hash-password.js
-# paste the scrypt$... output into OPERATOR_PASSWORD_HASH
+# paste the scrypt$... output into OPERATOR_PASSWORD_HASH,
+# or with users: into each user's passwordHashEnv variable
 ```
 
 **4. Add the Traefik TLS option.** Once, in Traefik's file provider:
@@ -141,7 +171,7 @@ curl -s https://mail-mcp.example.com/.well-known/oauth-protected-resource/mcp | 
 
 The second call should echo your `MCP_RESOURCE_URL` back as `resource`. If it doesn't, fix that before touching claude.ai.
 
-**6. Register the connector.** In claude.ai, Settings → Connectors → Add custom connector, URL `https://mail-mcp.example.com/mcp`. Claude registers itself, then sends you to the login page. Sign in with `OPERATOR_USERNAME` and the password you hashed. Tick what to grant per mailbox (send is off unless you tick it), approve, and the tools appear. To add a mailbox or grant send later, edit `mailboxes.yml`, restart, and re-authorize the connector.
+**6. Register the connector.** In claude.ai, Settings → Connectors → Add custom connector, URL `https://mail-mcp.example.com/mcp`. Claude registers itself, then sends you to the login page. Sign in with `OPERATOR_USERNAME` (or your user name from `users:`) and the password you hashed. Tick what to grant per mailbox (send is off unless you tick it), approve, and the tools appear. Every user adds the connector in their own claude.ai account and signs in as themselves. To add a mailbox or grant send later, edit `mailboxes.yml`, restart, and re-authorize the connector.
 
 ## Network notes
 
@@ -158,7 +188,7 @@ npm run dev                       # tsx watch; export configuration into your sh
 
 ### Tests
 
-`test/smoke.mjs` runs the whole thing end to end against a throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/) IMAP and SMTP server: OAuth discovery, dynamic client registration, PKCE, operator login, code exchange, refresh rotation, every tool (including marking and moving), and the negative cases (no token, foreign audience, wrong verifier, replayed code, unknown folder, moving to a missing folder). A second instance runs two mailboxes from a `mailboxes.yml` and really sends with `send_draft`. It checks delivery, the stripped Bcc, the Sent copy and the removed draft, and every refusal: a stranger under reply-only, a draft that replies to nothing, a planted draft posing as a conversation, a double send, and the daily cap.
+`test/smoke.mjs` runs the whole thing end to end against a throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/) IMAP and SMTP server: OAuth discovery, dynamic client registration, PKCE, operator sign-in and consent, code exchange, refresh rotation, every tool (including marking and moving), and the negative cases (no token, foreign audience, wrong verifier, replayed code, unknown folder, moving to a missing folder). A second instance runs two mailboxes from a `mailboxes.yml` and really sends with `send_draft`. It checks delivery, the stripped Bcc, the Sent copy and the removed draft, and every refusal: a stranger under reply-only, a draft that replies to nothing, a planted draft posing as a conversation, a double send, and the daily cap.
 
 GreenMail runs in Docker by default, so the only requirement is a running Docker daemon:
 
@@ -176,15 +206,15 @@ npm run build
 GREENMAIL_JAR=/tmp/greenmail.jar node test/smoke.mjs
 ```
 
-71 checks; all should pass.
+72 checks; all should pass.
 
-`test/auth.mjs` covers scope enforcement (including the mark and move scopes, per-mailbox scopes, legacy tokens and the operator's scope picker), `mailboxes.yml` validation and login throttling. It needs neither Java nor an IMAP server — every path it asserts is refused before the mailbox is reached — so it is the quick one to run after touching `src/auth/`:
+`test/auth.mjs` covers scope enforcement (including the mark and move scopes, per-mailbox scopes, legacy tokens and the two-step sign-in and scope picker), users (each sees and can grant only their own mailboxes, forged consent, stale and orphaned tokens, refresh), `mailboxes.yml` validation and login throttling. It needs neither Java nor an IMAP server — every path it asserts is refused before the mailbox is reached — so it is the quick one to run after touching `src/auth/`:
 
 ```bash
 npm run build && npm run test:auth
 ```
 
-61 checks; all should pass.
+93 checks; all should pass.
 
 `test/body-parts.mjs` unit-tests the structure walks behind `get_message` — which body part to render, which nodes are attachments, and how `References` is parsed — against BODYSTRUCTURE fixtures. No server at all:
 

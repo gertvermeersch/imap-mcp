@@ -1,4 +1,4 @@
-import { CAPABILITIES, type Capability, type Config } from '../config.js';
+import { CAPABILITIES, type Capability, type Config, type UserConfig } from '../config.js';
 
 /**
  * Scopes name a capability and a mailbox: mail:read:personal, mail:send:agent. Each
@@ -22,6 +22,26 @@ export function parseScope(scope: string): { capability: Capability; mailbox: st
  */
 export function supportedScopes(cfg: Config): string[] {
   return cfg.mailboxes.flatMap((m) => m.capabilities.map((c) => scopeFor(c, m.id)));
+}
+
+/**
+ * What one user may grant: one scope per capability they have in each of their
+ * mailboxes, in the order their entry lists the mailboxes. With the single
+ * OPERATOR_* login this is supportedScopes.
+ */
+export function userScopes(user: UserConfig): string[] {
+  return user.mailboxes.flatMap((m) => m.capabilities.map((c) => scopeFor(c, m.id)));
+}
+
+/**
+ * A token's scopes as they stand today: legacy ones translated, and anything
+ * the user may no longer grant dropped. Checked on every request, so taking a
+ * mailbox away from a user in mailboxes.yml takes effect on restart, without
+ * waiting for tokens to expire or rotating JWT_SECRET.
+ */
+export function effectiveScopes(cfg: Config, user: UserConfig, scopes: string[]): string[] {
+  const allowed = new Set(userScopes(user));
+  return normalizeGranted(cfg, scopes).filter((s) => allowed.has(s));
 }
 
 /** Matches the scopes from before mailboxes were named: mail:read, mail:draft, ... */

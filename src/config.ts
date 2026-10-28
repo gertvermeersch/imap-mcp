@@ -26,10 +26,14 @@ const schema = z.object({
   PORT: z.coerce.number().int().positive().default(8080),
 
   // --- Operator login ------------------------------------------------------
-  /** Username for the single human who may authorize this connector. */
-  OPERATOR_USERNAME: z.string().min(1),
+  /**
+   * The single human who may authorize this connector, with every mailbox.
+   * Required unless mailboxes.yml has a `users:` section, and refused with one:
+   * then each user signs in with their own password and gets their own mailboxes.
+   */
+  OPERATOR_USERNAME: optional(),
   /** scrypt hash produced by `npm run hash-password`. Never the plaintext. */
-  OPERATOR_PASSWORD_HASH: z.string().min(16),
+  OPERATOR_PASSWORD_HASH: optional(),
 
   // --- Token signing -------------------------------------------------------
   /** >=32 random bytes, base64 or hex. Rotating it invalidates all tokens. */
@@ -178,7 +182,24 @@ export interface MailboxConfig {
   send?: SendPolicy;
 }
 
-export type Config = EnvConfig & { mailboxes: MailboxConfig[] };
+/** One person who can sign in, and what they may grant in which mailbox. */
+export interface UserConfig {
+  /** The sign-in name, also the `sub` of every token issued to them. */
+  id: string;
+  passwordHash: string;
+  /**
+   * Their mailboxes, in file order, each with what this user may do in it: the
+   * mailbox's own capabilities, narrowed by the user's entry.
+   */
+  mailboxes: Array<{ id: string; capabilities: Capability[] }>;
+}
+
+export type Config = EnvConfig & {
+  mailboxes: MailboxConfig[];
+  users: UserConfig[];
+  /** True when mailboxes.yml lists users; false for the single OPERATOR_* login. */
+  multiUser: boolean;
+};
 
 const serverOverride = z
   .object({
@@ -216,8 +237,32 @@ const mailboxEntry = z
   })
   .strict();
 
+const userEntry = z
+  .object({
+    /** Name of the env var holding this user's scrypt hash — never the hash or password itself. */
+    passwordHashEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/, 'must be an environment variable name'),
+    /**
+     * A list of mailbox ids gives the user everything those mailboxes offer;
+     * a map of id to capabilities narrows it per mailbox.
+     */
+    mailboxes: z.union([
+      z.array(z.string().min(1)).min(1),
+      z
+        .record(z.string().min(1), z.array(z.enum(CAPABILITIES)))
+        .refine((m) => Object.keys(m).length > 0, 'give the user at least one mailbox')
+    ])
+  })
+  .strict();
+
 const mailboxFile = z
   .object({
+    users: z
+      .record(
+        z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/, 'user names are letters, digits, ., _, @ and -'),
+        userEntry
+      )
+      .refine((u) => Object.keys(u).length > 0, 'define at least one user, or leave out users:')
+      .optional(),
     mailboxes: z
       .record(
         z.string().regex(/^[a-z0-9][a-z0-9_-]{0,31}$/, 'ids are lowercase letters, digits, - and _'),
@@ -226,6 +271,8 @@ const mailboxFile = z
       .refine((m) => Object.keys(m).length > 0, 'define at least one mailbox')
   })
   .strict();
+
+type MailboxFile = z.infer<typeof mailboxFile>;
 
 function enabledCapabilities(env: EnvConfig, wanted: Iterable<Capability>): Capability[] {
   const on: Record<Capability, boolean> = {
@@ -262,7 +309,7 @@ function readMailboxFile(path: string): unknown {
   }
 }
 
-function mailboxesFromFile(env: EnvConfig, path: string): MailboxConfig[] {
+function parseMailboxFile(path: string): MailboxFile {
   const doc = readMailboxFile(path);
   const parsed = mailboxFile.safeParse(doc);
   if (!parsed.success) {
@@ -271,9 +318,12 @@ function mailboxesFromFile(env: EnvConfig, path: string): MailboxConfig[] {
       .join('\n');
     throw new Error(`Invalid mailbox configuration in ${path}:\n${issues}`);
   }
+  return parsed.data;
+}
 
+function mailboxesFromFile(env: EnvConfig, file: MailboxFile, path: string): MailboxConfig[] {
   const problems: string[] = [];
-  const out = Object.entries(parsed.data.mailboxes).map(([id, m]): MailboxConfig => {
+  const out = Object.entries(file.mailboxes).map(([id, m]): MailboxConfig => {
     const password = process.env[m.passwordEnv];
     if (!password) problems.push(`  ${id}: environment variable ${m.passwordEnv} is not set`);
 
@@ -334,6 +384,78 @@ function mailboxesFromFile(env: EnvConfig, path: string): MailboxConfig[] {
   return out;
 }
 
+/**
+ * Who may sign in. Without a `users:` section that is the one OPERATOR_* login,
+ * with every mailbox exactly as before. With one, each user gets the mailboxes
+ * their entry names, and the OPERATOR_* login must be gone: leaving it set would
+ * suggest an all-mailbox login that no longer exists.
+ */
+function usersFromFile(
+  env: EnvConfig,
+  file: MailboxFile,
+  mailboxes: MailboxConfig[],
+  path: string
+): UserConfig[] {
+  if (!file.users) {
+    if (!env.OPERATOR_USERNAME || !env.OPERATOR_PASSWORD_HASH || env.OPERATOR_PASSWORD_HASH.length < 16) {
+      throw new Error(
+        `Invalid configuration:\n  OPERATOR_USERNAME and OPERATOR_PASSWORD_HASH must be set, unless ${path} defines users:`
+      );
+    }
+    return [
+      {
+        id: env.OPERATOR_USERNAME,
+        passwordHash: env.OPERATOR_PASSWORD_HASH,
+        mailboxes: mailboxes.map((m) => ({ id: m.id, capabilities: m.capabilities }))
+      }
+    ];
+  }
+
+  const problems: string[] = [];
+  if (env.OPERATOR_USERNAME || env.OPERATOR_PASSWORD_HASH) {
+    problems.push(
+      '  OPERATOR_USERNAME / OPERATOR_PASSWORD_HASH are set, but users: replaces them: describe the operator as a user and remove both from the environment'
+    );
+  }
+  const byId = new Map(mailboxes.map((m) => [m.id, m]));
+  const out = Object.entries(file.users).map(([id, u]): UserConfig => {
+    const passwordHash = process.env[u.passwordHashEnv];
+    if (!passwordHash) {
+      problems.push(`  users.${id}: environment variable ${u.passwordHashEnv} is not set`);
+    } else if (!passwordHash.startsWith('scrypt$') || passwordHash.length < 16) {
+      problems.push(`  users.${id}: ${u.passwordHashEnv} is not a hash from hash-password`);
+    }
+
+    // The list form takes whatever the mailbox offers; the map form narrows it.
+    const wanted: Array<[string, Capability[] | undefined]> = Array.isArray(u.mailboxes)
+      ? [...new Set(u.mailboxes)].map((m) => [m, undefined])
+      : Object.entries(u.mailboxes);
+    const grants = wanted.flatMap(([mailboxId, caps]) => {
+      const mailbox = byId.get(mailboxId);
+      if (!mailbox) {
+        problems.push(`  users.${id}: there is no mailbox "${mailboxId}"`);
+        return [];
+      }
+      if (!caps) return [{ id: mailboxId, capabilities: mailbox.capabilities }];
+      // Checked against the file, not the ENABLE_* switches: a switch turning a
+      // capability off is deliberate, a user asking for one the mailbox never
+      // had is a typo.
+      const declared = new Set(['read', ...file.mailboxes[mailboxId]!.capabilities]);
+      for (const c of caps) {
+        if (!declared.has(c)) problems.push(`  users.${id}: mailbox "${mailboxId}" does not offer "${c}"`);
+      }
+      const set = new Set<Capability>(['read', ...caps]);
+      return [{ id: mailboxId, capabilities: mailbox.capabilities.filter((c) => set.has(c)) }];
+    });
+    return { id, passwordHash: passwordHash ?? '', mailboxes: grants };
+  });
+
+  if (problems.length > 0) {
+    throw new Error(`Invalid user configuration in ${path}:\n${problems.join('\n')}`);
+  }
+  return out;
+}
+
 function normalizeResourceUrl(raw: string): string {
   const u = new URL(raw);
   u.hash = '';
@@ -357,11 +479,15 @@ export function loadConfig(): Config {
     throw new Error(`Invalid configuration:\n${issues}`);
   }
   const env = parsed.data;
+  const file = parseMailboxFile(env.MAILBOXES_CONFIG);
+  // The first mailbox is the default: tokens issued before scopes named a
+  // mailbox ("mail:read") are read as applying to it.
+  const mailboxes = mailboxesFromFile(env, file, env.MAILBOXES_CONFIG);
   cached = {
     ...env,
-    // The first mailbox is the default: tokens issued before scopes named a
-    // mailbox ("mail:read") are read as applying to it.
-    mailboxes: mailboxesFromFile(env, env.MAILBOXES_CONFIG),
+    mailboxes,
+    users: usersFromFile(env, file, mailboxes, env.MAILBOXES_CONFIG),
+    multiUser: file.users !== undefined,
     MCP_RESOURCE_URL: normalizeResourceUrl(parsed.data.MCP_RESOURCE_URL),
     // The metadata document publishes the issuer as new URL(issuer).href,
     // which always carries a trailing slash on a bare origin. RFC 9207 has
